@@ -111,7 +111,7 @@ func TestTestSignal(t *testing.T) {
 // Marked as non-parallel because `t.Setenv` is not compatible with `t.Parallel`.
 func TestWaitTimeout(t *testing.T) {
 	t.Setenv("GITHUB_ACTIONS", "")
-	require.Equal(t, 3*time.Second, riversharedtest.WaitTimeout())
+	require.Equal(t, 5*time.Second, riversharedtest.WaitTimeout())
 
 	t.Setenv("GITHUB_ACTIONS", "true")
 	require.Equal(t, 10*time.Second, riversharedtest.WaitTimeout())

@@ -6,7 +6,6 @@ import (
 
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/startstop"
-	"github.com/riverqueue/river/rivershared/util/maputil"
 )
 
 // QueueMaintainer runs regular maintenance operations against job queues, like
@@ -18,15 +17,19 @@ type QueueMaintainer struct {
 	baseservice.BaseService
 	startstop.BaseStartStop
 
+	services       []startstop.Service
 	servicesByName map[string]startstop.Service
 }
 
 func NewQueueMaintainer(archetype *baseservice.Archetype, services []startstop.Service) *QueueMaintainer {
 	servicesByName := make(map[string]startstop.Service, len(services))
 	for _, service := range services {
-		servicesByName[serviceName(service)] = service
+		if _, ok := servicesByName[serviceName(service)]; !ok {
+			servicesByName[serviceName(service)] = service
+		}
 	}
 	return baseservice.Init(archetype, &QueueMaintainer{
+		services:       services,
 		servicesByName: servicesByName,
 	})
 }
@@ -35,7 +38,7 @@ func NewQueueMaintainer(archetype *baseservice.Archetype, services []startstop.S
 // is disabled. This is useful in tests where the extra sleep involved in a
 // staggered start up is not helpful for test run time.
 func (m *QueueMaintainer) StaggerStartupDisable(disabled bool) {
-	for _, svc := range m.servicesByName {
+	for _, svc := range m.services {
 		if svcWithDisable, ok := svc.(withStaggerStartupDisable); ok {
 			svcWithDisable.StaggerStartupDisable(disabled)
 		}
@@ -48,7 +51,7 @@ func (m *QueueMaintainer) Start(ctx context.Context) error {
 		return nil
 	}
 
-	for _, service := range m.servicesByName {
+	for _, service := range m.services {
 		if err := service.Start(ctx); err != nil {
 			return err
 		}
@@ -56,14 +59,14 @@ func (m *QueueMaintainer) Start(ctx context.Context) error {
 
 	go func() {
 		// Wait for all subservices to start up before signaling our own start.
-		startstop.WaitAllStarted(maputil.Values(m.servicesByName)...)
+		startstop.WaitAllStarted(m.services...)
 
 		started()
 		defer stopped() // this defer should come first so it's last out
 
 		<-ctx.Done()
 
-		startstop.StopAllParallel(maputil.Values(m.servicesByName)...)
+		startstop.StopAllParallel(m.services...)
 	}()
 
 	return nil

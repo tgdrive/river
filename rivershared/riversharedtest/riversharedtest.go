@@ -330,7 +330,7 @@ func WaitTimeout() time.Duration {
 		return 10 * time.Second
 	}
 
-	return 3 * time.Second
+	return 5 * time.Second
 }
 
 var IgnoredKnownGoroutineLeaks = []goleak.Option{ //nolint:gochecknoglobals

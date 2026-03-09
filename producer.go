@@ -70,6 +70,7 @@ type producerConfig struct {
 	ClientID     string
 	Completer    jobcompleter.JobCompleter
 	ErrorHandler ErrorHandler
+	GlobalLimit  int32
 
 	// FetchCooldown is the minimum amount of time to wait between fetches of new
 	// jobs. Jobs will only be fetched *at most* this often, but if no new jobs
@@ -85,6 +86,7 @@ type producerConfig struct {
 	HookLookupByJob        *hooklookup.JobHookLookup
 	HookLookupGlobal       hooklookup.HookLookupInterface
 	JobTimeout             time.Duration
+	LocalLimit             int32
 	MaxWorkers             int
 	MiddlewareLookupGlobal middlewarelookup.MiddlewareLookupInterface
 
@@ -111,6 +113,9 @@ type producerConfig struct {
 	SchedulerInterval            time.Duration
 	Schema                       string
 	StaleProducerRetentionPeriod time.Duration
+	PartitionKeyCacheTTL         time.Duration
+	PartitionByArgs              []string
+	PartitionByKind              bool
 	Workers                      *Workers
 }
 
@@ -211,8 +216,12 @@ type producer struct {
 	numJobsActive atomic.Int32
 	numJobsStuck  atomic.Int32
 
-	numJobsRan atomic.Uint64
-	paused     bool
+	numJobsRan        atomic.Uint64
+	paused            bool
+	partitionKeyCache struct {
+		expiresAt time.Time
+		keys      []string
+	}
 	// Receives control messages from the notifier goroutine. Written by notifier
 	// goroutine, only read from main goroutine.
 	queueControlCh chan *controlEventPayload
@@ -311,6 +320,7 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 		if err := p.pilot.QueueMetadataChanged(fetchCtx, p.exec, &riverpilot.QueueMetadataChangedParams{
 			Queue:    p.config.Queue,
 			Metadata: initialMetadata,
+			Schema:   p.config.Schema,
 		}); err != nil {
 			p.Logger.ErrorContext(fetchCtx, p.Name+": Error setting fetched queue metadata with pilot", slog.String("queue", p.config.Queue), slog.String("err", err.Error()))
 		}
@@ -352,6 +362,7 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 			if decoded.Queue != p.config.Queue {
 				return
 			}
+			p.partitionKeyCache.expiresAt = time.Time{}
 			p.Logger.DebugContext(workCtx, p.Name+": Received insert notification", slog.String("queue", decoded.Queue))
 			p.fetchLimiter.Call()
 		}
@@ -536,6 +547,7 @@ func (p *producer) fetchAndRunLoop(fetchCtx, workCtx context.Context) {
 				if err := p.pilot.QueueMetadataChanged(workCtx, p.exec, &riverpilot.QueueMetadataChangedParams{
 					Queue:    p.config.Queue,
 					Metadata: msg.Metadata,
+					Schema:   p.config.Schema,
 				}); err != nil {
 					p.Logger.ErrorContext(workCtx, p.Name+": Error updating queue metadata with pilot", slog.String("queue", p.config.Queue), slog.String("err", err.Error()))
 				}
@@ -688,9 +700,9 @@ func (p *producer) finalizeShutdown(ctx context.Context) {
 			Schema:     p.config.Schema,
 		}); err != nil {
 			// Don't retry on these errors:
-			// - context.Canceled: parent context is canceled, so retrying with a new timeout won't help
+			// - context.Canceled/context.DeadlineExceeded: parent context/timeout is done, so retrying with a new timeout won't help
 			// - ErrClosedPool: the database connection pool is closed, so retrying won't succeed
-			if errors.Is(err, context.Canceled) || errors.Is(err, riverdriver.ErrClosedPool) {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, riverdriver.ErrClosedPool) {
 				return nil
 			}
 			return err
@@ -755,14 +767,25 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 	// rarely hit, but exists to protect against degenerate cases.
 	const maxAttemptedBy = 100
 
+	availablePartitionKeys, err := p.getAvailablePartitionKeys(ctx)
+	if err != nil {
+		fetchResultCh <- producerFetchResult{err: err}
+		return
+	}
+
 	jobs, err := p.pilot.JobGetAvailable(ctx, p.exec, p.state, &riverdriver.JobGetAvailableParams{
-		ClientID:       p.config.ClientID,
-		MaxAttemptedBy: maxAttemptedBy,
-		MaxToLock:      count,
-		Now:            p.Time.NowUTCOrNil(),
-		Queue:          p.config.Queue,
-		ProducerID:     p.id.Load(),
-		Schema:         p.config.Schema,
+		AvailablePartitionKeys: availablePartitionKeys,
+		ClientID:               p.config.ClientID,
+		GlobalLimit:            p.config.GlobalLimit,
+		LocalLimit:             p.config.LocalLimit,
+		MaxAttemptedBy:         maxAttemptedBy,
+		MaxToLock:              count,
+		Now:                    p.Time.NowUTCOrNil(),
+		PartitionByArgs:        p.config.PartitionByArgs,
+		PartitionByKind:        p.config.PartitionByKind,
+		Queue:                  p.config.Queue,
+		ProducerID:             p.id.Load(),
+		Schema:                 p.config.Schema,
 	})
 	if err != nil {
 		fetchResultCh <- producerFetchResult{err: err}
@@ -770,6 +793,31 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 	}
 
 	fetchResultCh <- producerFetchResult{jobs: jobs}
+}
+
+func (p *producer) getAvailablePartitionKeys(ctx context.Context) ([]string, error) {
+	if (!p.config.PartitionByKind && p.config.PartitionByArgs == nil) || p.config.PartitionKeyCacheTTL == -1 || p.config.PartitionKeyCacheTTL < p.config.FetchCooldown {
+		return nil, nil
+	}
+	now := p.Time.NowUTC()
+	if now.Before(p.partitionKeyCache.expiresAt) {
+		return p.partitionKeyCache.keys, nil
+	}
+	keys, err := p.exec.JobGetAvailablePartitionKeys(ctx, &riverdriver.JobGetAvailablePartitionKeysParams{
+		PartitionByArgs: p.config.PartitionByArgs,
+		PartitionByKind: p.config.PartitionByKind,
+		Queue:           p.config.Queue,
+		Schema:          p.config.Schema,
+	})
+	if err != nil {
+		if errors.Is(err, riverdriver.ErrNotImplemented) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	p.partitionKeyCache.keys = keys
+	p.partitionKeyCache.expiresAt = now.Add(p.config.PartitionKeyCacheTTL)
+	return keys, nil
 }
 
 // Periodically logs an informational log line giving some insight into the
@@ -854,7 +902,12 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 }
 
 func (p *producer) maxJobsToFetch() int {
-	return p.config.MaxWorkers - int(p.numJobsActive.Load())
+	active := int(p.numJobsActive.Load())
+	limit := p.config.MaxWorkers - active
+	if p.config.LocalLimit > 0 {
+		limit = min(limit, int(p.config.LocalLimit)-active)
+	}
+	return limit
 }
 
 func (p *producer) handleWorkerDone(job *rivertype.JobRow) {

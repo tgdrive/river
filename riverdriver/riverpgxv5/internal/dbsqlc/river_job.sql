@@ -539,6 +539,7 @@ FROM updated_job;
 WITH jobs_to_schedule AS (
     SELECT
         id,
+        coalesce(sequence_key, metadata->>'sequence_key') AS sequence_key,
         unique_key,
         unique_states,
         priority,
@@ -583,11 +584,14 @@ unique_conflicts AS (
 job_updates AS (
     SELECT
         job.id,
+        job.sequence_key,
         job.unique_key,
         job.unique_states,
         CASE
+            WHEN job.row_num IS NULL AND job.sequence_key IS NOT NULL THEN 'pending'::/* TEMPLATE: schema */river_job_state
             WHEN job.row_num IS NULL THEN 'available'::/* TEMPLATE: schema */river_job_state
             WHEN uc.unique_key IS NOT NULL THEN 'discarded'::/* TEMPLATE: schema */river_job_state
+            WHEN job.row_num = 1 AND job.sequence_key IS NOT NULL THEN 'pending'::/* TEMPLATE: schema */river_job_state
             WHEN job.row_num = 1 THEN 'available'::/* TEMPLATE: schema */river_job_state
             ELSE 'discarded'::/* TEMPLATE: schema */river_job_state
         END AS new_state,

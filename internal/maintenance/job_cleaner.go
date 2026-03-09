@@ -32,6 +32,10 @@ func (ts *JobCleanerTestSignals) Init(tb testutil.TestingTB) {
 type JobCleanerConfig struct {
 	riversharedmaintenance.BatchSizes
 
+	// MoveDiscardedToDeadLetter configures the cleaner to move discarded jobs to
+	// dead letter storage before they're deleted.
+	MoveDiscardedToDeadLetter bool
+
 	// CancelledJobRetentionPeriod is the amount of time to keep cancelled jobs
 	// around before they're removed permanently.
 	//
@@ -116,6 +120,7 @@ func NewJobCleaner(archetype *baseservice.Archetype, config *JobCleanerConfig, e
 			CancelledJobRetentionPeriod: cmp.Or(config.CancelledJobRetentionPeriod, riversharedmaintenance.CancelledJobRetentionPeriodDefault),
 			CompletedJobRetentionPeriod: cmp.Or(config.CompletedJobRetentionPeriod, riversharedmaintenance.CompletedJobRetentionPeriodDefault),
 			DiscardedJobRetentionPeriod: cmp.Or(config.DiscardedJobRetentionPeriod, riversharedmaintenance.DiscardedJobRetentionPeriodDefault),
+			MoveDiscardedToDeadLetter:   config.MoveDiscardedToDeadLetter,
 			QueuesExcluded:              config.QueuesExcluded,
 			Interval:                    cmp.Or(config.Interval, riversharedmaintenance.JobCleanerIntervalDefault),
 			Schema:                      config.Schema,
@@ -196,12 +201,25 @@ func (s *JobCleaner) runOnce(ctx context.Context) (*jobCleanerRunOnceResult, err
 			ctx, cancelFunc := context.WithTimeout(ctx, s.Config.Timeout)
 			defer cancelFunc()
 
+			numMoved := 0
+			if s.Config.MoveDiscardedToDeadLetter && s.Config.DiscardedJobRetentionPeriod != -1 {
+				moved, err := s.exec.JobDeadLetterMoveDiscarded(ctx, &riverdriver.JobDeadLetterMoveDiscardedParams{
+					DiscardedFinalizedAtHorizon: time.Now().Add(-s.Config.DiscardedJobRetentionPeriod),
+					Max:                         s.batchSize(),
+					Schema:                      s.Config.Schema,
+				})
+				if err != nil && !errors.Is(err, riverdriver.ErrNotImplemented) {
+					return 0, fmt.Errorf("error moving discarded jobs to dead letter: %w", err)
+				}
+				numMoved = len(moved)
+			}
+
 			numDeleted, err := s.exec.JobDeleteBefore(ctx, &riverdriver.JobDeleteBeforeParams{
 				CancelledDoDelete:           s.Config.CancelledJobRetentionPeriod != -1,
 				CancelledFinalizedAtHorizon: time.Now().Add(-s.Config.CancelledJobRetentionPeriod),
 				CompletedDoDelete:           s.Config.CompletedJobRetentionPeriod != -1,
 				CompletedFinalizedAtHorizon: time.Now().Add(-s.Config.CompletedJobRetentionPeriod),
-				DiscardedDoDelete:           s.Config.DiscardedJobRetentionPeriod != -1,
+				DiscardedDoDelete:           s.Config.DiscardedJobRetentionPeriod != -1 && !s.Config.MoveDiscardedToDeadLetter,
 				DiscardedFinalizedAtHorizon: time.Now().Add(-s.Config.DiscardedJobRetentionPeriod),
 				Max:                         s.batchSize(),
 				QueuesExcluded:              s.Config.QueuesExcluded,
@@ -213,7 +231,7 @@ func (s *JobCleaner) runOnce(ctx context.Context) (*jobCleanerRunOnceResult, err
 
 			s.reducedBatchSizeBreaker.ResetIfNotOpen()
 
-			return numDeleted, nil
+			return numDeleted + numMoved, nil
 		}()
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {

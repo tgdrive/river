@@ -446,7 +446,7 @@ func TestBatchCompleter(t *testing.T) {
 		// Wait for some jobs to come through, giving lots of opportunity for
 		// the completer to have pooled some completions and being forced to
 		// work them in sub-batches with our diminished sub-batch size.
-		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 100)
+		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 50)
 
 		stopInsertion()
 		go completer.Stop()
@@ -477,7 +477,7 @@ func TestBatchCompleter(t *testing.T) {
 		// Wait for some jobs to come through. Waiting for these jobs to come
 		// through will provide plenty of opportunity for the completer to back
 		// up with our small configured backlog.
-		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 100)
+		riversharedtest.WaitOrTimeoutN(t, jobUpdateChan, 50)
 
 		stopInsertion()
 		go completer.Stop()

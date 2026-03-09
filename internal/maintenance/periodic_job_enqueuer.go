@@ -19,6 +19,7 @@ import (
 	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivershared/testsignal"
 	"github.com/riverqueue/river/rivershared/util/maputil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivershared/util/testutil"
 	"github.com/riverqueue/river/rivershared/util/timeutil"
@@ -88,6 +89,7 @@ type InsertFunc func(ctx context.Context, tx riverdriver.ExecutorTx, insertParam
 
 type PeriodicJobEnqueuerConfig struct {
 	AdvisoryLockPrefix int32
+	DurableConfig      *PeriodicJobEnqueuerDurableConfig
 
 	HookLookupGlobal hooklookup.HookLookupInterface
 
@@ -103,6 +105,13 @@ type PeriodicJobEnqueuerConfig struct {
 	// Schema where River tables are located. Empty string omits schema, causing
 	// Postgres to default to `search_path`.
 	Schema string
+}
+
+type PeriodicJobEnqueuerDurableConfig struct {
+	NextRunAtRatchetFunc  func(nextRunAt, now time.Time) time.Time
+	StaleThreshold        time.Duration
+	StartStaggerSpread    time.Duration
+	StartStaggerThreshold int
 }
 
 func (c *PeriodicJobEnqueuerConfig) mustValidate() *PeriodicJobEnqueuerConfig {
@@ -163,6 +172,7 @@ func NewPeriodicJobEnqueuer(archetype *baseservice.Archetype, config *PeriodicJo
 	svc := baseservice.Init(archetype, &PeriodicJobEnqueuer{
 		Config: (&PeriodicJobEnqueuerConfig{
 			AdvisoryLockPrefix: config.AdvisoryLockPrefix,
+			DurableConfig:      config.DurableConfig,
 			HookLookupGlobal:   hookLookupGlobal,
 			Insert:             config.Insert,
 			PeriodicJobs:       config.PeriodicJobs,
@@ -366,6 +376,20 @@ func (s *PeriodicJobEnqueuer) Start(ctx context.Context) error {
 
 		// Initial set of periodic job IDs mapped to next run at times fetched
 		// from a configured pilot. Not used in most cases.
+		now := s.Time.NowUTC()
+		if s.Config.DurableConfig != nil {
+			for _, periodicJob := range initialPeriodicJobs {
+				periodicJob.NextRunAt = s.Config.DurableConfig.NextRunAtRatchetFunc(periodicJob.NextRunAt, now)
+			}
+			if s.Config.DurableConfig.StartStaggerThreshold != -1 && len(initialPeriodicJobs) >= s.Config.DurableConfig.StartStaggerThreshold {
+				for _, periodicJob := range initialPeriodicJobs {
+					if !periodicJob.NextRunAt.After(now) {
+						periodicJob.NextRunAt = now.Add(randutil.DurationBetween(time.Millisecond, s.Config.DurableConfig.StartStaggerSpread))
+					}
+				}
+			}
+		}
+
 		initialPeriodicJobsMap := sliceutil.KeyBy(initialPeriodicJobs,
 			func(j *riverpilot.PeriodicJob) (string, time.Time) { return j.ID, j.NextRunAt })
 
@@ -600,8 +624,9 @@ func (s *PeriodicJobEnqueuer) periodicJobKeepAliveAndReapPeriodically(ctx contex
 
 					if len(s.periodicJobIDs) > 0 {
 						if _, err := s.Config.Pilot.PeriodicJobKeepAliveAndReap(ctx, s.exec, &riverpilot.PeriodicJobKeepAliveAndReapParams{
-							ID:     maputil.Keys(s.periodicJobIDs),
-							Schema: s.Config.Schema,
+							ID:             maputil.Keys(s.periodicJobIDs),
+							Schema:         s.Config.Schema,
+							StaleThreshold: durableStaleThreshold(s.Config.DurableConfig),
 						}); err != nil {
 							s.Logger.ErrorContext(ctx, s.Name+": Error executing periodic job keep alive and reap", "error", err.Error())
 							return
@@ -615,6 +640,13 @@ func (s *PeriodicJobEnqueuer) periodicJobKeepAliveAndReapPeriodically(ctx contex
 	}()
 
 	return nil
+}
+
+func durableStaleThreshold(config *PeriodicJobEnqueuerDurableConfig) time.Duration {
+	if config == nil || config.StaleThreshold == 0 {
+		return 24 * time.Hour
+	}
+	return config.StaleThreshold
 }
 
 const periodicJobEnqueuerVeryLongDuration = 24 * time.Hour

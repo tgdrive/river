@@ -63,6 +63,8 @@ type Pilot interface {
 //
 // API is not stable. DO NOT USE.
 type PilotInitParams struct {
+	DurablePeriodicJobsEnabled bool
+
 	// Insert is the insert implementation from the main client. This is
 	// used as a low-level insert that shouldn't be accessible via public API,
 	// but should be accessible to deep integrations.
@@ -117,7 +119,7 @@ type PilotPeriodicJob interface {
 // PeriodicJob represents a durable periodic job.
 //
 // TODO: Get rid of this in favor of rivertype.PeriodicJob the next time we're
-// making River <-> River Pro API contract changes.
+// making API contract changes.
 type PeriodicJob struct {
 	ID        string
 	CreatedAt time.Time
@@ -130,8 +132,9 @@ type PeriodicJobGetAllParams struct {
 }
 
 type PeriodicJobKeepAliveAndReapParams struct {
-	ID     []string
-	Schema string
+	ID             []string
+	Schema         string
+	StaleThreshold time.Duration
 }
 
 type PeriodicJobUpsertManyParams struct {
@@ -165,4 +168,5 @@ type ProducerShutdownParams struct {
 type QueueMetadataChangedParams struct {
 	Queue    string
 	Metadata []byte
+	Schema   string
 }
