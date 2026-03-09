@@ -70,6 +70,7 @@ type producerConfig struct {
 	ClientID     string
 	Completer    jobcompleter.JobCompleter
 	ErrorHandler ErrorHandler
+	GlobalLimit  int32
 
 	// FetchCooldown is the minimum amount of time to wait between fetches of new
 	// jobs. Jobs will only be fetched *at most* this often, but if no new jobs
@@ -85,6 +86,7 @@ type producerConfig struct {
 	HookLookupByJob        *hooklookup.JobHookLookup
 	HookLookupGlobal       hooklookup.HookLookupInterface
 	JobTimeout             time.Duration
+	LocalLimit             int32
 	MaxWorkers             int
 	MiddlewareLookupGlobal middlewarelookup.MiddlewareLookupInterface
 
@@ -111,6 +113,8 @@ type producerConfig struct {
 	SchedulerInterval            time.Duration
 	Schema                       string
 	StaleProducerRetentionPeriod time.Duration
+	PartitionByArgs              []string
+	PartitionByKind              bool
 	Workers                      *Workers
 }
 
@@ -311,6 +315,7 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 		if err := p.pilot.QueueMetadataChanged(fetchCtx, p.exec, &riverpilot.QueueMetadataChangedParams{
 			Queue:    p.config.Queue,
 			Metadata: initialMetadata,
+			Schema:   p.config.Schema,
 		}); err != nil {
 			p.Logger.ErrorContext(fetchCtx, p.Name+": Error setting fetched queue metadata with pilot", slog.String("queue", p.config.Queue), slog.String("err", err.Error()))
 		}
@@ -536,6 +541,7 @@ func (p *producer) fetchAndRunLoop(fetchCtx, workCtx context.Context) {
 				if err := p.pilot.QueueMetadataChanged(workCtx, p.exec, &riverpilot.QueueMetadataChangedParams{
 					Queue:    p.config.Queue,
 					Metadata: msg.Metadata,
+					Schema:   p.config.Schema,
 				}); err != nil {
 					p.Logger.ErrorContext(workCtx, p.Name+": Error updating queue metadata with pilot", slog.String("queue", p.config.Queue), slog.String("err", err.Error()))
 				}
@@ -756,13 +762,17 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 	const maxAttemptedBy = 100
 
 	jobs, err := p.pilot.JobGetAvailable(ctx, p.exec, p.state, &riverdriver.JobGetAvailableParams{
-		ClientID:       p.config.ClientID,
-		MaxAttemptedBy: maxAttemptedBy,
-		MaxToLock:      count,
-		Now:            p.Time.NowUTCOrNil(),
-		Queue:          p.config.Queue,
-		ProducerID:     p.id.Load(),
-		Schema:         p.config.Schema,
+		ClientID:        p.config.ClientID,
+		GlobalLimit:     p.config.GlobalLimit,
+		LocalLimit:      p.config.LocalLimit,
+		MaxAttemptedBy:  maxAttemptedBy,
+		MaxToLock:       count,
+		Now:             p.Time.NowUTCOrNil(),
+		PartitionByArgs: p.config.PartitionByArgs,
+		PartitionByKind: p.config.PartitionByKind,
+		Queue:           p.config.Queue,
+		ProducerID:      p.id.Load(),
+		Schema:          p.config.Schema,
 	})
 	if err != nil {
 		fetchResultCh <- producerFetchResult{err: err}

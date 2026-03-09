@@ -132,14 +132,14 @@ func TestSchema[TTx any](ctx context.Context, tb testutil.TestingTB, driver rive
 	// An initial pass to calculate a friendly package name that'll be used to
 	// prefix this package's schemas so that it won't clash with packages
 	// running their own tests in parallel. Generated name is like `river` or
-	// `jobcompleter` or `riverpro`.
+	// `jobcompleter` or other package names.
 	genSchemaBase.Do(func() {
 		var (
 			programCounterAddr, _, _, _ = runtime.Caller(4 + opts.skipExtraFrames)     // skip `TestSchema.func1` (closure) + `sync.(*Once).doSlow` + `sync.(*Once).Do` + `TestSchema` and end up at `TestSchema`'s caller
 			funcName                    = runtime.FuncForPC(programCounterAddr).Name() // like: github.com/riverqueue/river.Test_Client.func1
 		)
 
-		packageName = packageFromFunc(funcName) // like: `river` (or `jobcompleter`, or `riverpro`)
+		packageName = packageFromFunc(funcName) // like: `river` (or `jobcompleter`)
 
 		// Check to make sure we're skipping the right number of frames above.
 		// If the location of `runtime.Caller` is changed at all (a single new
@@ -441,8 +441,8 @@ func TestTxPgx(ctx context.Context, tb testing.TB) pgx.Tx {
 
 // TestTxPgxDriver starts a test transaction that's rolled back automatically as
 // the test case is cleaning itself up. Unlike TestTxPgx, this variant takes a
-// driver and options for greater flexibility, including allowing for Pro
-// drivers, while still sharing common setup like schema search path.
+// driver and options for greater flexibility while still sharing common setup
+// like schema search path.
 func TestTxPgxDriver(ctx context.Context, tb testing.TB, driver riverdriver.Driver[pgx.Tx], opts *TestTxOpts) (pgx.Tx, string) {
 	tb.Helper()
 
@@ -473,9 +473,8 @@ type TestTxOpts struct {
 	// IsTestTxHelper should be set to true for if TestTx is being called from
 	// within a secondary helper that's in a common testing package. This causes
 	// an extra stack frame to be skipped when determining the name of the test
-	// schema being used for test transactions. So instead of `riverdbtest` or
-	// `riverprodbtest` we get the real name of the package being tested (e.g.
-	// `river` or `riverpro`).
+	// schema being used for test transactions. So instead of `riverdbtest` we get
+	// the real name of the package being tested (e.g. `river`).
 	IsTestTxHelper bool
 
 	// ProcurePool returns a database pool that will be set to the input driver

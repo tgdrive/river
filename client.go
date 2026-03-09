@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -120,6 +122,14 @@ type Config struct {
 	// Defaults to 7 days.
 	DiscardedJobRetentionPeriod time.Duration
 
+	// DeadLetterQueue configures moving discarded jobs to a dead letter table
+	// instead of deleting them permanently.
+	DeadLetterQueue *DeadLetterConfig
+
+	// DurablePeriodicJobs enables and configures persistence for periodic job
+	// next run times.
+	DurablePeriodicJobs *DurablePeriodicJobsConfig
+
 	// ErrorHandler can be configured to be invoked in case of an error or panic
 	// occurring in a job. This is often useful for logging and exception
 	// tracking, but can also be used to customize retry behavior.
@@ -145,6 +155,18 @@ type Config struct {
 	//
 	// Defaults to 1 second.
 	FetchPollInterval time.Duration
+
+	// WorkflowRescuerInterval is the interval at which workflow recovery checks
+	// run.
+	WorkflowRescuerInterval time.Duration
+
+	// SequenceSchedulerInterval is the interval at which sequence promotion and
+	// scan checks run.
+	SequenceSchedulerInterval time.Duration
+
+	// PartitionKeyCacheTTL is how long to cache computed partition keys used by
+	// queue concurrency limits.
+	PartitionKeyCacheTTL time.Duration
 
 	// ID is the unique identifier for this client. If not set, a random
 	// identifier will be generated.
@@ -407,7 +429,9 @@ func (c *Config) WithDefaults() *Config {
 		AdvisoryLockPrefix:          c.AdvisoryLockPrefix,
 		CancelledJobRetentionPeriod: cmp.Or(c.CancelledJobRetentionPeriod, riversharedmaintenance.CancelledJobRetentionPeriodDefault),
 		CompletedJobRetentionPeriod: cmp.Or(c.CompletedJobRetentionPeriod, riversharedmaintenance.CompletedJobRetentionPeriodDefault),
+		DeadLetterQueue:             c.DeadLetterQueue,
 		DiscardedJobRetentionPeriod: cmp.Or(c.DiscardedJobRetentionPeriod, riversharedmaintenance.DiscardedJobRetentionPeriodDefault),
+		DurablePeriodicJobs:         c.DurablePeriodicJobs,
 		ErrorHandler:                c.ErrorHandler,
 		FetchCooldown:               cmp.Or(c.FetchCooldown, FetchCooldownDefault),
 		FetchPollInterval:           cmp.Or(c.FetchPollInterval, FetchPollIntervalDefault),
@@ -418,6 +442,7 @@ func (c *Config) WithDefaults() *Config {
 		Logger:                      logger,
 		MaxAttempts:                 cmp.Or(c.MaxAttempts, MaxAttemptsDefault),
 		Middleware:                  c.Middleware,
+		PartitionKeyCacheTTL:        c.PartitionKeyCacheTTL,
 		PeriodicJobs:                c.PeriodicJobs,
 		PollOnly:                    c.PollOnly,
 		Queues:                      c.Queues,
@@ -426,10 +451,12 @@ func (c *Config) WithDefaults() *Config {
 		RescueStuckJobsAfter:        cmp.Or(c.RescueStuckJobsAfter, rescueAfter),
 		RetryPolicy:                 retryPolicy,
 		Schema:                      c.Schema,
+		SequenceSchedulerInterval:   c.SequenceSchedulerInterval,
 		SkipJobKindValidation:       c.SkipJobKindValidation,
 		SkipUnknownJobCheck:         c.SkipUnknownJobCheck,
 		Test:                        c.Test,
 		TestOnly:                    c.TestOnly,
+		WorkflowRescuerInterval:     c.WorkflowRescuerInterval,
 		WorkerMiddleware:            c.WorkerMiddleware,
 		Workers:                     c.Workers,
 		queuePollInterval:           c.queuePollInterval,
@@ -455,6 +482,15 @@ func (c *Config) validate() error {
 	}
 	if c.FetchPollInterval < c.FetchCooldown {
 		return fmt.Errorf("FetchPollInterval cannot be shorter than FetchCooldown (%s)", c.FetchCooldown)
+	}
+	if c.PartitionKeyCacheTTL < 0 {
+		return errors.New("PartitionKeyCacheTTL cannot be less than zero")
+	}
+	if c.SequenceSchedulerInterval < 0 {
+		return errors.New("SequenceSchedulerInterval cannot be less than zero")
+	}
+	if c.WorkflowRescuerInterval < 0 {
+		return errors.New("WorkflowRescuerInterval cannot be less than zero")
 	}
 	if len(c.ID) > 100 {
 		return errors.New("ID cannot be longer than 100 characters")
@@ -527,6 +563,12 @@ func (c *Config) willExecuteJobs() bool {
 
 // QueueConfig contains queue-specific configuration.
 type QueueConfig struct {
+	// Concurrency configures queue-level concurrency limits.
+	Concurrency *ConcurrencyConfig
+
+	// Ephemeral configures ephemeral queue behavior.
+	Ephemeral *QueueEphemeralConfig
+
 	// FetchCooldown is the minimum amount of time to wait between fetches of new
 	// jobs. Jobs will only be fetched *at most* this often, but if no new jobs
 	// are coming in via LISTEN/NOTIFY then fetches may be delayed as long as
@@ -557,6 +599,21 @@ type QueueConfig struct {
 	//
 	// Requires a minimum of 1, and a maximum of 10,000.
 	MaxWorkers int
+
+	// CancelledJobRetentionPeriod overrides global retention for cancelled jobs
+	// in this queue. A zero value inherits global defaults. A value of -1 keeps
+	// cancelled jobs forever.
+	CancelledJobRetentionPeriod time.Duration
+
+	// CompletedJobRetentionPeriod overrides global retention for completed jobs
+	// in this queue. A zero value inherits global defaults. A value of -1 keeps
+	// completed jobs forever.
+	CompletedJobRetentionPeriod time.Duration
+
+	// DiscardedJobRetentionPeriod overrides global retention for discarded jobs
+	// in this queue. A zero value inherits global defaults. A value of -1 keeps
+	// discarded jobs forever.
+	DiscardedJobRetentionPeriod time.Duration
 }
 
 func (c QueueConfig) validate(queueName string, clientFetchCooldown time.Duration, clientFetchPollInterval time.Duration) error {
@@ -565,6 +622,20 @@ func (c QueueConfig) validate(queueName string, clientFetchCooldown time.Duratio
 	}
 	if c.FetchPollInterval < 0 {
 		return errors.New("FetchPollInterval cannot be less than zero")
+	}
+	if c.CancelledJobRetentionPeriod < -1 {
+		return errors.New("CancelledJobRetentionPeriod cannot be less than zero, except for -1 (infinite)")
+	}
+	if c.CompletedJobRetentionPeriod < -1 {
+		return errors.New("CompletedJobRetentionPeriod cannot be less than zero, except for -1 (infinite)")
+	}
+	if c.DiscardedJobRetentionPeriod < -1 {
+		return errors.New("DiscardedJobRetentionPeriod cannot be less than zero, except for -1 (infinite)")
+	}
+	if c.Concurrency != nil {
+		if err := c.Concurrency.validate(); err != nil {
+			return err
+		}
 	}
 
 	resolvedFetchCooldown := cmp.Or(c.FetchCooldown, clientFetchCooldown)
@@ -581,6 +652,56 @@ func (c QueueConfig) validate(queueName string, clientFetchCooldown time.Duratio
 	}
 
 	return nil
+}
+
+// DeadLetterConfig configures dead letter queue behavior.
+type DeadLetterConfig struct {
+	Enabled bool
+}
+
+// DurablePeriodicJobsConfig configures durable periodic jobs.
+type DurablePeriodicJobsConfig struct {
+	Enabled bool
+
+	// StaleThreshold is the duration after which stale persisted periodic job
+	// records may be reaped.
+	StaleThreshold time.Duration
+
+	// StartStaggerSpread controls random staggering applied to backlogged durable
+	// periodic jobs on startup.
+	StartStaggerSpread time.Duration
+
+	// StartStaggerThreshold controls how many backlogged jobs must exist before
+	// startup staggering is applied.
+	StartStaggerThreshold int
+}
+
+// QueueEphemeralConfig configures ephemeral queue behavior.
+type QueueEphemeralConfig struct {
+	Enabled bool
+}
+
+// ConcurrencyConfig configures queue-level concurrency limits.
+type ConcurrencyConfig struct {
+	GlobalLimit int
+	LocalLimit  int
+	Partition   PartitionConfig
+}
+
+func (c *ConcurrencyConfig) validate() error {
+	if c.GlobalLimit < 0 {
+		return errors.New("Concurrency.GlobalLimit cannot be less than zero")
+	}
+	if c.LocalLimit < 0 {
+		return errors.New("Concurrency.LocalLimit cannot be less than zero")
+	}
+	return nil
+}
+
+// PartitionConfig configures queue concurrency partitioning behavior.
+type PartitionConfig struct {
+	ByArgs []string
+	ByKind bool
 }
 
 // Client is a single isolated instance of River. Your application may use
@@ -804,9 +925,10 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		client.pilot = &riverpilot.StandardPilot{}
 	}
 	client.pilot.PilotInit(archetype, (&riverpilot.PilotInitParams{
-		Insert:               client.insertMany,
-		NotifyNonTxJobInsert: client.notifyProducerWithoutListenerJobFetch,
-		WorkerMetadata:       workerMetadata,
+		DurablePeriodicJobsEnabled: config.DurablePeriodicJobs != nil && config.DurablePeriodicJobs.Enabled,
+		Insert:                     client.insertMany,
+		NotifyNonTxJobInsert:       client.notifyProducerWithoutListenerJobFetch,
+		WorkerMetadata:             workerMetadata,
 	}).Validate())
 	pluginPilot, _ := client.pilot.(pilotPlugin)
 
@@ -867,16 +989,57 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		maintenanceServices := []startstop.Service{}
 
 		{
+			queueHasCustomRetention := func(queueConfig QueueConfig) bool {
+				return queueConfig.CancelledJobRetentionPeriod != 0 ||
+					queueConfig.CompletedJobRetentionPeriod != 0 ||
+					queueConfig.DiscardedJobRetentionPeriod != 0
+			}
+
+			customRetentionQueues := make([]string, 0)
+			for queueName, queueConfig := range config.Queues {
+				if queueHasCustomRetention(queueConfig) {
+					customRetentionQueues = append(customRetentionQueues, queueName)
+				}
+			}
+
+			globalQueuesExcluded := append([]string{}, client.pilot.JobCleanerQueuesExcluded()...)
+			globalQueuesExcluded = append(globalQueuesExcluded, customRetentionQueues...)
+
 			jobCleaner := maintenance.NewJobCleaner(archetype, &maintenance.JobCleanerConfig{
 				CancelledJobRetentionPeriod: config.CancelledJobRetentionPeriod,
 				CompletedJobRetentionPeriod: config.CompletedJobRetentionPeriod,
 				DiscardedJobRetentionPeriod: config.DiscardedJobRetentionPeriod,
-				QueuesExcluded:              client.pilot.JobCleanerQueuesExcluded(),
+				MoveDiscardedToDeadLetter:   config.DeadLetterQueue != nil && config.DeadLetterQueue.Enabled,
+				QueuesExcluded:              globalQueuesExcluded,
 				Schema:                      config.Schema,
 				Timeout:                     config.JobCleanerTimeout,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, jobCleaner)
 			client.testSignals.jobCleaner = &jobCleaner.TestSignals
+
+			if len(customRetentionQueues) > 0 {
+				allQueueNames := maputil.Keys(config.Queues)
+				for _, queueName := range customRetentionQueues {
+					queueConfig := config.Queues[queueName]
+					queuesExcluded := make([]string, 0, len(allQueueNames)-1)
+					for _, otherQueueName := range allQueueNames {
+						if otherQueueName != queueName {
+							queuesExcluded = append(queuesExcluded, otherQueueName)
+						}
+					}
+
+					queueCleaner := maintenance.NewJobCleaner(archetype, &maintenance.JobCleanerConfig{
+						CancelledJobRetentionPeriod: cmp.Or(queueConfig.CancelledJobRetentionPeriod, config.CancelledJobRetentionPeriod),
+						CompletedJobRetentionPeriod: cmp.Or(queueConfig.CompletedJobRetentionPeriod, config.CompletedJobRetentionPeriod),
+						DiscardedJobRetentionPeriod: cmp.Or(queueConfig.DiscardedJobRetentionPeriod, config.DiscardedJobRetentionPeriod),
+						MoveDiscardedToDeadLetter:   config.DeadLetterQueue != nil && config.DeadLetterQueue.Enabled,
+						QueuesExcluded:              queuesExcluded,
+						Schema:                      config.Schema,
+						Timeout:                     config.JobCleanerTimeout,
+					}, driver.GetExecutor())
+					maintenanceServices = append(maintenanceServices, queueCleaner)
+				}
+			}
 		}
 
 		{
@@ -1678,6 +1841,36 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 		metadata = []byte("{}")
 	}
 
+	metadataMap := map[string]any{}
+	if err := json.Unmarshal(metadata, &metadataMap); err != nil {
+		return nil, fmt.Errorf("metadata must be a valid JSON object: %w", err)
+	}
+	if metadataMap == nil {
+		metadataMap = map[string]any{}
+	}
+
+	if _, ok := args.(JobArgsWithEphemeral); ok {
+		metadataMap["ephemeral"] = true
+	}
+	if queueConfig, ok := config.Queues[queue]; ok && queueConfig.Ephemeral != nil && queueConfig.Ephemeral.Enabled {
+		metadataMap["ephemeral"] = true
+	}
+
+	if argsWithSequence, ok := args.(JobArgsWithSequence); ok {
+		sequenceOpts := argsWithSequence.SequenceOpts()
+		metadataMap["sequence_key"] = sequenceKey(sequenceOpts, args, args.Kind(), queue, encodedArgs)
+	}
+
+	if argsWithBatch, ok := args.(JobArgsWithBatch); ok {
+		batchOpts := argsWithBatch.BatchOpts()
+		metadataMap["batch_key"] = batchKey(batchOpts, args, args.Kind(), encodedArgs)
+	}
+
+	metadata, err = json.Marshal(metadataMap)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling metadata to JSON: %w", err)
+	}
+
 	insertParams := &rivertype.JobInsertParams{
 		Args:        args,
 		CreatedAt:   createdAt,
@@ -1717,6 +1910,121 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	}
 
 	return insertParams, nil
+}
+
+func hashStrings(parts ...string) string {
+	h := fnv.New64a()
+	for _, part := range parts {
+		_, _ = h.Write([]byte(part))
+		_, _ = h.Write([]byte("|"))
+	}
+	return fmt.Sprintf("%x", h.Sum64())
+}
+
+func sequenceKey(opts SequenceOpts, args JobArgs, kind, queue string, encodedArgs []byte) string {
+	parts := make([]string, 0, 3)
+	if !opts.ExcludeKind {
+		parts = append(parts, kind)
+	}
+	if opts.ByQueue {
+		parts = append(parts, queue)
+	}
+	if opts.ByArgs {
+		parts = append(parts, argsForFeatureKey(args, encodedArgs, "sequence"))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, kind)
+	}
+	return hashStrings(parts...)
+}
+
+func batchKey(opts BatchOpts, args JobArgs, kind string, encodedArgs []byte) string {
+	if opts.ByArgs {
+		return hashStrings(kind, argsForFeatureKey(args, encodedArgs, "batch"))
+	}
+	return hashStrings(kind)
+}
+
+func argsForFeatureKey(args JobArgs, fallback []byte, tag string) string {
+	filtered, ok := extractTaggedArgsJSON(args, tag)
+	if ok {
+		return filtered
+	}
+	return string(fallback)
+}
+
+func extractTaggedArgsJSON(args JobArgs, tag string) (string, bool) {
+	v := reflect.ValueOf(args)
+	if !v.IsValid() {
+		return "", false
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return "", false
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return "", false
+	}
+
+	t := v.Type()
+	out := make(map[string]any)
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.PkgPath != "" { // unexported
+			continue
+		}
+
+		riverTag := field.Tag.Get("river")
+		if !hasRiverTagValue(riverTag, tag) {
+			continue
+		}
+
+		jsonName := jsonFieldName(field)
+		if jsonName == "" {
+			continue
+		}
+
+		out[jsonName] = v.Field(i).Interface()
+	}
+
+	if len(out) == 0 {
+		return "", false
+	}
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+func hasRiverTagValue(tag, value string) bool {
+	if tag == "" {
+		return false
+	}
+	for _, part := range strings.Split(tag, ",") {
+		if strings.TrimSpace(part) == value {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonFieldName(field reflect.StructField) string {
+	jsonTag := field.Tag.Get("json")
+	if jsonTag == "-" {
+		return ""
+	}
+	if jsonTag == "" {
+		return field.Name
+	}
+	parts := strings.Split(jsonTag, ",")
+	if len(parts) == 0 || parts[0] == "" {
+		return field.Name
+	}
+	return parts[0]
 }
 
 var errNoDriverDBPool = errors.New("driver must have non-nil database pool to use non-transactional methods like Insert and InsertMany (try InsertTx or InsertManyTx instead")
@@ -2180,18 +2488,27 @@ func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) (*p
 		return nil, &QueueAlreadyAddedError{Name: queueName}
 	}
 
+	concurrency := &ConcurrencyConfig{}
+	if queueConfig.Concurrency != nil {
+		concurrency = queueConfig.Concurrency
+	}
+
 	producer := newProducer(&c.baseService.Archetype, c.driver.GetExecutor(), c.pilot, &producerConfig{
 		ClientID:                     c.config.ID,
 		Completer:                    c.completer,
 		ErrorHandler:                 c.config.ErrorHandler,
 		FetchCooldown:                cmp.Or(queueConfig.FetchCooldown, c.config.FetchCooldown),
 		FetchPollInterval:            cmp.Or(queueConfig.FetchPollInterval, c.config.FetchPollInterval),
+		GlobalLimit:                  int32(concurrency.GlobalLimit),
 		HookLookupByJob:              c.hookLookupByJob,
 		HookLookupGlobal:             c.hookLookupGlobal,
 		JobTimeout:                   c.config.JobTimeout,
+		LocalLimit:                   int32(concurrency.LocalLimit),
 		MaxWorkers:                   queueConfig.MaxWorkers,
 		MiddlewareLookupGlobal:       c.middlewareLookupGlobal,
 		Notifier:                     c.notifier,
+		PartitionByArgs:              concurrency.Partition.ByArgs,
+		PartitionByKind:              concurrency.Partition.ByKind,
 		Queue:                        queueName,
 		QueueEventCallback:           c.subscriptionManager.distributeQueueEvent,
 		QueuePollInterval:            c.config.queuePollInterval,

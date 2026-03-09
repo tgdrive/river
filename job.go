@@ -92,3 +92,49 @@ type JobArgsWithInsertOpts interface {
 	// system defaults. These can also be overridden at insertion time.
 	InsertOpts() InsertOpts
 }
+
+// JobArgsWithBatch is an optional interface that enables batch processing for a
+// job type.
+type JobArgsWithBatch interface {
+	JobArgs
+
+	// BatchOpts returns options that control how jobs are grouped for batch
+	// execution.
+	BatchOpts() BatchOpts
+}
+
+// BatchOpts configures how jobs are grouped when worked in a batch.
+type BatchOpts struct {
+	// ByArgs enables partitioning by encoded args so jobs with different args are
+	// grouped into separate batches.
+	ByArgs bool
+}
+
+// JobArgsWithSequence is an optional interface that enables sequence behavior
+// for a job type.
+type JobArgsWithSequence interface {
+	JobArgs
+
+	// SequenceOpts returns options that control how sequence keys are computed.
+	SequenceOpts() SequenceOpts
+}
+
+// SequenceOpts configures sequence partitioning and progression behavior.
+type SequenceOpts struct {
+	ByArgs              bool
+	ByQueue             bool
+	ContinueOnCancelled bool
+	ContinueOnDiscarded bool
+	ExcludeKind         bool
+}
+
+// JobArgsWithEphemeral is an optional interface that marks a job type as
+// ephemeral (deleted immediately on successful completion).
+type JobArgsWithEphemeral interface {
+	JobArgs
+
+	EphemeralOpts() EphemeralOpts
+}
+
+// EphemeralOpts configures ephemeral job behavior.
+type EphemeralOpts struct{}

@@ -204,9 +204,18 @@ type Executor interface {
 	JobCountByQueueAndState(ctx context.Context, params *JobCountByQueueAndStateParams) ([]*JobCountByQueueAndStateResult, error)
 	JobCountByState(ctx context.Context, params *JobCountByStateParams) (int, error)
 	JobDelete(ctx context.Context, params *JobDeleteParams) (*rivertype.JobRow, error)
+	JobDeadLetterDeleteByID(ctx context.Context, params *JobDeadLetterDeleteByIDParams) (*rivertype.JobRow, error)
+	JobDeadLetterGetAll(ctx context.Context, params *JobDeadLetterGetAllParams) ([]*rivertype.JobRow, error)
+	JobDeadLetterGetByID(ctx context.Context, params *JobDeadLetterGetByIDParams) (*rivertype.JobRow, error)
+	JobDeadLetterMoveByID(ctx context.Context, params *JobDeadLetterMoveByIDParams) (*rivertype.JobRow, error)
+	JobDeadLetterMoveDiscarded(ctx context.Context, params *JobDeadLetterMoveDiscardedParams) ([]*rivertype.JobRow, error)
 	JobDeleteBefore(ctx context.Context, params *JobDeleteBeforeParams) (int, error)
+	JobDeleteByIDMany(ctx context.Context, params *JobDeleteByIDManyParams) ([]*rivertype.JobRow, error)
 	JobDeleteMany(ctx context.Context, params *JobDeleteManyParams) ([]*rivertype.JobRow, error)
 	JobGetAvailable(ctx context.Context, params *JobGetAvailableParams) ([]*rivertype.JobRow, error)
+	JobGetAvailableForBatch(ctx context.Context, params *JobGetAvailableForBatchParams) ([]*rivertype.JobRow, error)
+	JobGetAvailableLimited(ctx context.Context, params *JobGetAvailableLimitedParams) ([]*rivertype.JobRow, error)
+	JobGetAvailablePartitionKeys(ctx context.Context, params *JobGetAvailablePartitionKeysParams) ([]string, error)
 	JobGetByID(ctx context.Context, params *JobGetByIDParams) (*rivertype.JobRow, error)
 	JobGetByIDMany(ctx context.Context, params *JobGetByIDManyParams) ([]*rivertype.JobRow, error)
 	JobGetByKindMany(ctx context.Context, params *JobGetByKindManyParams) ([]*rivertype.JobRow, error)
@@ -257,6 +266,44 @@ type Executor interface {
 
 	NotifyMany(ctx context.Context, params *NotifyManyParams) error
 	PGAdvisoryXactLock(ctx context.Context, key int64) (*struct{}, error)
+	PGTryAdvisoryXactLock(ctx context.Context, key int64) (bool, error)
+
+	PeriodicJobGetAll(ctx context.Context, params *PeriodicJobGetAllParams) ([]*PeriodicJob, error)
+	PeriodicJobGetByID(ctx context.Context, params *PeriodicJobGetByIDParams) (*PeriodicJob, error)
+	PeriodicJobInsert(ctx context.Context, params *PeriodicJobInsertParams) (*PeriodicJob, error)
+	PeriodicJobKeepAliveAndReap(ctx context.Context, params *PeriodicJobKeepAliveAndReapParams) ([]*PeriodicJob, error)
+	PeriodicJobUpsertMany(ctx context.Context, params *PeriodicJobUpsertManyParams) ([]*PeriodicJob, error)
+
+	ProducerDelete(ctx context.Context, params *ProducerDeleteParams) error
+	ProducerGetByID(ctx context.Context, params *ProducerGetByIDParams) (*Producer, error)
+	ProducerInsertOrUpdate(ctx context.Context, params *ProducerInsertOrUpdateParams) (*Producer, error)
+	ProducerKeepAlive(ctx context.Context, params *ProducerKeepAliveParams) (*Producer, error)
+	ProducerListByQueue(ctx context.Context, params *ProducerListByQueueParams) ([]*ProducerListByQueueResult, error)
+	ProducerUpdate(ctx context.Context, params *ProducerUpdateParams) (*Producer, error)
+
+	QueueGetMetadataForInsert(ctx context.Context, params *QueueGetMetadataForInsertParams) ([]*QueueGetMetadataForInsertResult, error)
+
+	SequenceAppendMany(ctx context.Context, params *SequenceAppendManyParams) (int, error)
+	SequenceList(ctx context.Context, params *SequenceListParams) ([]*Sequence, error)
+	SequencePromote(ctx context.Context, params *SequencePromoteParams) ([]string, error)
+	SequencePromoteFromTable(ctx context.Context, params *SequencePromoteFromTableParams) (*SequencePromoteFromTableResult, error)
+	SequenceScanAndPromoteStalled(ctx context.Context, params *SequenceScanAndPromoteStalledParams) (*SequenceScanAndPromoteStalledResult, error)
+
+	WorkflowCancel(ctx context.Context, params *WorkflowCancelParams) ([]*rivertype.JobRow, error)
+	WorkflowCancelWithFailedDepsMany(ctx context.Context, params *WorkflowCancelWithFailedDepsManyParams) ([]*rivertype.JobRow, error)
+	WorkflowGetPendingIDs(ctx context.Context, params *WorkflowGetPendingIDsParams) ([]*WorkflowGetPendingIDsRow, error)
+	WorkflowJobGetByTaskName(ctx context.Context, params *WorkflowJobGetByTaskNameParams) (*rivertype.JobRow, error)
+	WorkflowJobList(ctx context.Context, params *WorkflowJobListParams) ([]*rivertype.JobRow, error)
+	WorkflowListActive(ctx context.Context, params *WorkflowListParams) ([]*WorkflowListItem, error)
+	WorkflowListAll(ctx context.Context, params *WorkflowListParams) ([]*WorkflowListItem, error)
+	WorkflowListInactive(ctx context.Context, params *WorkflowListParams) ([]*WorkflowListItem, error)
+	WorkflowLoadDepTasksAndIDs(ctx context.Context, params *WorkflowLoadDepTasksAndIDsParams) (map[string]*int64, error)
+	WorkflowLoadJobsWithDeps(ctx context.Context, params *WorkflowLoadJobsWithDepsParams) ([]*WorkflowTaskWithJob, error)
+	WorkflowLoadTaskWithDeps(ctx context.Context, params *WorkflowLoadTaskWithDepsParams) (*WorkflowTaskWithJob, error)
+	WorkflowLoadTasksByNames(ctx context.Context, params *WorkflowLoadTasksByNamesParams) ([]*WorkflowTask, error)
+	WorkflowRetry(ctx context.Context, params *WorkflowRetryParams) ([]*rivertype.JobRow, error)
+	WorkflowRetryLockAndCheckRunning(ctx context.Context, params *WorkflowRetryLockAndCheckRunningParams) (*WorkflowRetryLockAndCheckRunningResult, error)
+	WorkflowStageJobsByIDMany(ctx context.Context, params *WorkflowStageJobsByIDManyParams) ([]*rivertype.JobRow, error)
 
 	QueueCreateOrSetUpdatedAt(ctx context.Context, params *QueueCreateOrSetUpdatedAtParams) (*rivertype.Queue, error)
 	QueueDeleteExpired(ctx context.Context, params *QueueDeleteExpiredParams) ([]string, error)
@@ -374,6 +421,32 @@ type JobDeleteParams struct {
 	Schema string
 }
 
+type JobDeadLetterDeleteByIDParams struct {
+	ID     int64
+	Schema string
+}
+
+type JobDeadLetterGetAllParams struct {
+	Max    int
+	Schema string
+}
+
+type JobDeadLetterGetByIDParams struct {
+	ID     int64
+	Schema string
+}
+
+type JobDeadLetterMoveByIDParams struct {
+	ID     int64
+	Schema string
+}
+
+type JobDeadLetterMoveDiscardedParams struct {
+	DiscardedFinalizedAtHorizon time.Time
+	Max                         int
+	Schema                      string
+}
+
 type JobDeleteBeforeParams struct {
 	CancelledDoDelete           bool
 	CancelledFinalizedAtHorizon time.Time
@@ -395,14 +468,63 @@ type JobDeleteManyParams struct {
 	WhereClause   string
 }
 
+type JobDeleteByIDManyParams struct {
+	ID     []int64
+	Schema string
+}
+
 type JobGetAvailableParams struct {
-	ClientID       string
-	MaxAttemptedBy int
-	MaxToLock      int
-	Now            *time.Time
-	ProducerID     int64
-	Queue          string
-	Schema         string
+	ClientID        string
+	GlobalLimit     int32
+	LocalLimit      int32
+	MaxAttemptedBy  int
+	MaxToLock       int
+	Now             *time.Time
+	PartitionByArgs []string
+	PartitionByKind bool
+	ProducerID      int64
+	Queue           string
+	Schema          string
+}
+
+type JobGetAvailableForBatchParams struct {
+	AttemptedBy      string
+	BatchID          string
+	BatchKey         string
+	BatchLeaderJobID int64
+	ClientID         string
+	Kind             string
+	Max              int32
+	MaxAttemptedBy   int
+	MaxToLock        int
+	Now              *time.Time
+	ProducerID       int64
+	Queue            string
+	Schema           string
+}
+
+type JobGetAvailableLimitedParams struct {
+	JobGetAvailableParams *JobGetAvailableParams
+
+	AvailablePartitionKeys                []string
+	ClientID                              string
+	CurrentProducerPartitionKeys          []string
+	CurrentProducerPartitionRunningCounts []int32
+	GlobalLimit                           int32
+	LocalLimit                            int32
+	MaxAttemptedBy                        int
+	MaxToLock                             int
+	Now                                   *time.Time
+	PartitionByArgs                       []string
+	PartitionByKind                       bool
+	ProducerID                            int64
+	Queue                                 string
+	Schema                                string
+}
+
+type JobGetAvailablePartitionKeysParams struct {
+	Queue  string
+	Schema string
 }
 
 type JobGetByIDParams struct {
@@ -772,6 +894,325 @@ type ProducerKeepAliveParams struct {
 	StaleUpdatedAtHorizon time.Time
 }
 
+type PeriodicJob struct {
+	ID        int64
+	IDString  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Name      string
+	Queue     string
+	NextRunAt time.Time
+	Metadata  []byte
+}
+
+type PeriodicJobGetAllParams struct {
+	Max                   int
+	Schema                string
+	StaleUpdatedAtHorizon time.Time
+}
+
+type PeriodicJobGetByIDParams struct {
+	ID       int64
+	IDString string
+	Schema   string
+}
+
+type PeriodicJobInsertParams struct {
+	ID        string
+	Metadata  []byte
+	Name      string
+	NextRunAt time.Time
+	Queue     string
+	Schema    string
+	UpdatedAt *time.Time
+}
+
+type PeriodicJobKeepAliveAndReapParams struct {
+	ID                    int64
+	IDList                []string
+	Now                   *time.Time
+	Schema                string
+	StaleUpdatedAtHorizon time.Time
+}
+
+type PeriodicJobUpsertManyParams struct {
+	Jobs         []*PeriodicJobUpsertParams
+	PeriodicJobs []*PeriodicJobInsertParams
+	Schema       string
+}
+
+type PeriodicJobUpsertParams struct {
+	ID        string
+	NextRunAt time.Time
+	UpdatedAt time.Time
+}
+
+type Producer struct {
+	ID         int64
+	ClientID   string
+	MaxWorkers int32
+	PausedAt   *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	QueueName  string
+	Metadata   []byte
+}
+
+type ProducerDeleteParams struct {
+	ID     int64
+	Schema string
+}
+
+type ProducerGetByIDParams struct {
+	ID     int64
+	Schema string
+}
+
+type ProducerInsertOrUpdateParams struct {
+	ID         int64
+	ClientID   string
+	CreatedAt  *time.Time
+	MaxWorkers int32
+	Metadata   []byte
+	Now        *time.Time
+	PausedAt   *time.Time
+	QueueName  string
+	Schema     string
+	UpdatedAt  *time.Time
+}
+
+type ProducerListByQueueParams struct {
+	QueueName string
+	Schema    string
+}
+
+type ProducerListByQueueResult struct {
+	Producer  *Producer
+	Running   int32
+	ID        int64
+	QueueName string
+	Metadata  []byte
+	UpdatedAt time.Time
+}
+
+type ProducerUpdateParams struct {
+	ID                 int64
+	MaxWorkers         int32
+	MaxWorkersDoUpdate bool
+	Metadata           []byte
+	MetadataDoUpdate   bool
+	PausedAt           *time.Time
+	PausedAtDoUpdate   bool
+	Schema             string
+	UpdatedAt          *time.Time
+}
+
+type QueueGetMetadataForInsertParams struct {
+	Names      []string
+	QueueNames []string
+	Schema     string
+}
+
+type QueueGetMetadataForInsertResult struct {
+	Concurrency []byte
+	Name        string
+	Metadata    []byte
+}
+
+type Sequence struct {
+	ID          int64
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	Queue       string
+	Key         string
+	LatestJobID int64
+}
+
+type SequenceAppendManyParams struct {
+	JobIDs  []int64
+	Keys    []string
+	SeqKeys []string
+	Queue   string
+	Schema  string
+}
+
+type SequenceListParams struct {
+	Max      int
+	MaxCount int
+	Queue    string
+	Schema   string
+}
+
+type SequencePromoteParams struct {
+	GracePeriod time.Duration
+	Keys        []string
+	Max         int
+	Now         *time.Time
+	Queue       string
+	Schema      string
+}
+
+type SequencePromoteFromTableParams struct {
+	GracePeriod time.Duration
+	Max         int
+	Now         *time.Time
+	Schema      string
+}
+
+type SequencePromoteFromTableResult struct {
+	Continue       bool
+	NumDeleted     int
+	PromotedKeys   []string
+	PromotedQueues []string
+}
+
+type SequenceScanAndPromoteStalledParams struct {
+	GracePeriod     time.Duration
+	LastSequenceKey string
+	Max             int
+	Now             *time.Time
+	Schema          string
+}
+
+type SequenceScanAndPromoteStalledResult struct {
+	Continue       bool
+	LastSeqKey     string
+	PromotedQueues []string
+}
+
+type WorkflowCancelParams struct {
+	CancelAttemptedAt time.Time
+	ControlTopic      string
+	Schema            string
+	WorkflowID        string
+}
+
+type WorkflowCancelWithFailedDepsManyParams struct {
+	JobID                []int64
+	Schema               string
+	WorkflowDepsFailedAt time.Time
+	WorkflowIDs          []string
+}
+
+type WorkflowGetPendingIDsParams struct {
+	LastWorkflowID string
+	LimitCount     int32
+	Schema         string
+	WorkflowID     string
+}
+
+type WorkflowGetPendingIDsRow struct {
+	JobID      int64
+	Task       string
+	WorkflowID string
+}
+
+type WorkflowJobGetByTaskNameParams struct {
+	Schema     string
+	TaskName   string
+	WorkflowID string
+}
+
+type WorkflowJobListParams struct {
+	PaginationLimit  int
+	PaginationOffset int
+	Schema           string
+	WorkflowID       string
+}
+
+type WorkflowListParams struct {
+	After           string
+	Max             int
+	PaginationLimit int
+	Schema          string
+}
+
+type WorkflowListItem struct {
+	CountAvailable  int
+	CountCancelled  int
+	CountCompleted  int
+	CountDiscarded  int
+	CountFailedDeps int
+	CountPending    int
+	CountRetryable  int
+	CountRunning    int
+	CountScheduled  int
+	ID              string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	Name            *string
+	Metadata        []byte
+}
+
+type WorkflowLoadDepTasksAndIDsParams struct {
+	Recursive  bool
+	Task       string
+	Schema     string
+	TaskNames  []string
+	WorkflowID string
+}
+
+type WorkflowTask struct {
+	ID         int64
+	State      rivertype.JobState
+	Task       string
+	WorkflowID string
+	TaskName   string
+	Metadata   []byte
+	Deps       []string
+}
+
+type WorkflowTaskWithJob struct {
+	Deps       []string
+	WorkflowID string
+	Task       *WorkflowTask
+	Job        *rivertype.JobRow
+}
+
+type WorkflowLoadJobsWithDepsParams struct {
+	JobIds     []int64
+	Schema     string
+	WorkflowID string
+}
+
+type WorkflowLoadTaskWithDepsParams struct {
+	Schema     string
+	Task       string
+	TaskName   string
+	WorkflowID string
+}
+
+type WorkflowLoadTasksByNamesParams struct {
+	Schema     string
+	TaskNames  []string
+	WorkflowID string
+}
+
+type WorkflowRetryParams struct {
+	Mode         string
+	Now          time.Time
+	ResetHistory bool
+	Schema       string
+	WorkflowID   string
+}
+
+type WorkflowRetryLockAndCheckRunningParams struct {
+	Schema     string
+	WorkflowID string
+}
+
+type WorkflowRetryLockAndCheckRunningResult struct {
+	CanRetry         bool
+	WorkflowIsActive bool
+}
+
+type WorkflowStageJobsByIDManyParams struct {
+	ID               []int64
+	Schema           string
+	WorkflowIDs      []string
+	WorkflowStagedAt time.Time
+}
+
 type QueueCreateOrSetUpdatedAtParams struct {
 	Metadata  []byte
 	Name      string
@@ -874,6 +1315,6 @@ func MigrationLineMainTruncateTables(version int) []string {
 		return []string{"river_job", "river_leader", "river_queue"}
 	}
 
-	// 0 (zero value), 5, 6
-	return []string{"river_job", "river_leader", "river_queue", "river_client", "river_client_queue"}
+	// 0 (zero value), and latest versions.
+	return []string{"river_job", "river_leader", "river_queue", "river_client", "river_client_queue", "river_job_dead_letter", "river_periodic_job", "river_producer", "river_sequence", "river_workflow"}
 }

@@ -80,24 +80,36 @@ type RiverClientQueue struct {
 }
 
 type RiverJob struct {
-	ID           int64
-	Args         []byte
-	Attempt      int16
-	AttemptedAt  *time.Time
-	AttemptedBy  []string
-	CreatedAt    time.Time
-	Errors       [][]byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int16
-	Metadata     []byte
-	Priority     int16
-	Queue        string
-	State        RiverJobState
-	ScheduledAt  time.Time
-	Tags         []string
-	UniqueKey    []byte
-	UniqueStates pgtype.Bits
+	ID               int64
+	Args             []byte
+	Attempt          int16
+	AttemptedAt      *time.Time
+	AttemptedBy      []string
+	CreatedAt        time.Time
+	Errors           [][]byte
+	FinalizedAt      *time.Time
+	Kind             string
+	MaxAttempts      int16
+	Metadata         []byte
+	Priority         int16
+	Queue            string
+	State            RiverJobState
+	ScheduledAt      time.Time
+	Tags             []string
+	UniqueKey        []byte
+	UniqueStates     pgtype.Bits
+	WorkflowID       pgtype.Text
+	WorkflowTaskName pgtype.Text
+	WorkflowDeps     []string
+	SequenceKey      pgtype.Text
+	BatchKey         pgtype.Text
+	BatchID          pgtype.Text
+}
+
+type RiverJobDeadLetter struct {
+	ID      int64
+	Job     []byte
+	MovedAt time.Time
 }
 
 type RiverLeader struct {
@@ -113,10 +125,45 @@ type RiverMigration struct {
 	CreatedAt time.Time
 }
 
+type RiverPeriodicJob struct {
+	ID        int64
+	Name      string
+	Queue     string
+	NextRunAt time.Time
+	Metadata  []byte
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type RiverProducer struct {
+	ID        int64
+	QueueName string
+	Metadata  []byte
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 type RiverQueue struct {
 	Name      string
 	CreatedAt time.Time
 	Metadata  []byte
 	PausedAt  *time.Time
+	UpdatedAt time.Time
+}
+
+type RiverSequence struct {
+	ID          int64
+	Queue       string
+	Key         string
+	LatestJobID int64
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type RiverWorkflow struct {
+	ID        string
+	Name      string
+	Metadata  []byte
+	CreatedAt time.Time
 	UpdatedAt time.Time
 }

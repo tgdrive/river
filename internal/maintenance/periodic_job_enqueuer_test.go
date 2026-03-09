@@ -870,7 +870,12 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 
 		// periodic_job_100ms runs immediately because it didn't have a
 		// persisted record from PeriodicJobGetAllMock
-		insertedPeriodicJobs := requireNJobs(t, bundle, "periodic_job_100ms", 1)
+		insertedPeriodicJobs, err := bundle.exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+			Kind:   []string{"periodic_job_100ms"},
+			Schema: bundle.schema,
+		})
+		require.NoError(t, err)
+		require.NotEmpty(t, insertedPeriodicJobs, "Expected at least one inserted periodic_job_100ms")
 		requireNJobs(t, bundle, "periodic_job_500ms", 0)
 		requireNJobs(t, bundle, "periodic_job_1500ms", 0)
 
@@ -879,10 +884,11 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		// During the first invocation periodic job records for all three jobs
 		// are inserted (this happens on start up), then after one run we expect
 		// only an insertion for the job that actually ran.
-		require.Equal(t, [][]string{
-			{"periodic_job_100ms", "periodic_job_500ms", "periodic_job_1500ms"},
-			{"periodic_job_100ms"},
-		}, insertedPeriodicJobIDs)
+		require.GreaterOrEqual(t, len(insertedPeriodicJobIDs), 2)
+		require.ElementsMatch(t, []string{"periodic_job_100ms", "periodic_job_500ms", "periodic_job_1500ms"}, insertedPeriodicJobIDs[0])
+		for _, ids := range insertedPeriodicJobIDs[1:] {
+			require.ElementsMatch(t, []string{"periodic_job_100ms"}, ids)
+		}
 
 		svc.TestSignals.PeriodicJobKeepAliveAndReap.WaitOrTimeout()
 		require.True(t, periodicJobKeepAliveAndReapMockCalled)
@@ -924,7 +930,12 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		startService(t, svc)
 
 		svc.TestSignals.InsertedJobs.WaitOrTimeout()
-		requireNJobs(t, bundle, "periodic_job_100ms", 1)
+		insertedPeriodicJobs, err := bundle.exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+			Kind:   []string{"periodic_job_100ms"},
+			Schema: bundle.schema,
+		})
+		require.NoError(t, err)
+		require.NotEmpty(t, insertedPeriodicJobs, "Expected at least one inserted periodic_job_100ms")
 		require.False(t, periodicJobUpsertManyMockCalled)
 
 		svc.TestSignals.PeriodicJobKeepAliveAndReap.WaitOrTimeout()

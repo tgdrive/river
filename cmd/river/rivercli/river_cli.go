@@ -34,8 +34,7 @@ type Config struct {
 	// scheme.
 	DriverProcurer DriverProcurer
 	// Name is the human-friendly named of the executable, used while showing
-	// version output. Usually this is just "River", but it could be "River
-	// Pro".
+	// version output. Usually this is just "River".
 	Name string
 }
 

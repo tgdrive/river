@@ -346,7 +346,7 @@ type HookPeriodicJobsStartParams struct {
 	// jobs that've been previously removed, but for which their database record
 	// has not yet been reaped.
 	//
-	// This property will be empty unless durable jobs (a pro feature) are
+	// This property will be empty unless durable jobs are
 	// enabled.
 	DurableJobs []*DurablePeriodicJob
 }
