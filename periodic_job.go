@@ -1,6 +1,7 @@
 package river
 
 import (
+	"errors"
 	"time"
 
 	"github.com/riverqueue/river/internal/maintenance"
@@ -230,6 +231,57 @@ func (b *PeriodicJobBundle) RemoveMany(periodicJobHandles []rivertype.PeriodicJo
 // Has no effect if no jobs with the given IDs are configured.
 func (b *PeriodicJobBundle) RemoveManyByID(ids []string) {
 	b.periodicJobEnqueuer.RemoveManyByID(ids)
+}
+
+// ReplaceByID replaces a periodic job by ID with a new periodic job
+// configuration.
+//
+// The replacement periodic job must use the same ID as the target ID.
+//
+// Returns a new periodic job handle which can be used to subsequently remove
+// the replacement job if desired.
+//
+// Adding or removing periodic jobs has no effect unless this client is elected
+// leader because only the leader enqueues periodic jobs. To make sure that a
+// new periodic job is fully enabled or disabled, it should be added or removed
+// from _every_ active River client across all processes.
+func (b *PeriodicJobBundle) ReplaceByID(id string, periodicJob *PeriodicJob) rivertype.PeriodicJobHandle {
+	handle, err := b.periodicJobEnqueuer.ReplaceByIDSafely(id, b.mapper.toInternal(periodicJob))
+	if err != nil {
+		panic(err)
+	}
+	return handle
+}
+
+// ReplaceByIDSafely is the same as ReplaceByID, but it returns an error in the
+// case of a validation problem, unknown ID, or ID mismatch instead of
+// panicking.
+func (b *PeriodicJobBundle) ReplaceByIDSafely(id string, periodicJob *PeriodicJob) (rivertype.PeriodicJobHandle, error) {
+	return b.periodicJobEnqueuer.ReplaceByIDSafely(id, b.mapper.toInternal(periodicJob))
+}
+
+// ReplaceScheduleByID replaces only the schedule for an existing periodic job
+// by ID while keeping all other job configuration the same.
+//
+// Adding or removing periodic jobs has no effect unless this client is elected
+// leader because only the leader enqueues periodic jobs. To make sure that a
+// new periodic job is fully enabled or disabled, it should be added or removed
+// from _every_ active River client across all processes.
+func (b *PeriodicJobBundle) ReplaceScheduleByID(id string, scheduleFunc PeriodicSchedule) {
+	if err := b.ReplaceScheduleByIDSafely(id, scheduleFunc); err != nil {
+		panic(err)
+	}
+}
+
+// ReplaceScheduleByIDSafely is the same as ReplaceScheduleByID, but it returns
+// an error in the case of an unknown ID or invalid schedule instead of
+// panicking.
+func (b *PeriodicJobBundle) ReplaceScheduleByIDSafely(id string, scheduleFunc PeriodicSchedule) error {
+	if scheduleFunc == nil {
+		return errors.New("PeriodicSchedule must be set")
+	}
+
+	return b.periodicJobEnqueuer.ReplaceScheduleByIDSafely(id, scheduleFunc.Next)
 }
 
 // An empty set of periodic job opts used as a default when none are specified.

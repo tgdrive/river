@@ -5385,6 +5385,62 @@ func Test_Client_Maintenance(t *testing.T) {
 		require.Len(t, jobs, 1)
 	})
 
+	t.Run("PeriodicJobEnqueuerReplaceByID", func(t *testing.T) {
+		t.Parallel()
+
+		type OriginalPeriodicArgs struct {
+			testutil.JobArgsReflectKind[OriginalPeriodicArgs]
+		}
+		type ReplacementPeriodicArgs struct {
+			testutil.JobArgsReflectKind[ReplacementPeriodicArgs]
+		}
+
+		var (
+			dbPool = riversharedtest.DBPool(ctx, t)
+			driver = riverpgxv5.New(dbPool)
+			schema = riverdbtest.TestSchema(ctx, t, driver, nil)
+			config = newTestConfig(t, schema)
+		)
+
+		AddWorker(config.Workers, WorkFunc(func(ctx context.Context, job *Job[OriginalPeriodicArgs]) error { return nil }))
+		AddWorker(config.Workers, WorkFunc(func(ctx context.Context, job *Job[ReplacementPeriodicArgs]) error { return nil }))
+
+		client := newTestClient(t, dbPool, config)
+		client.testSignals.Init(t)
+		exec := client.driver.GetExecutor()
+
+		client.PeriodicJobs().Add(NewPeriodicJob(cron.Every(15*time.Minute), func() (JobArgs, *InsertOpts) {
+			return OriginalPeriodicArgs{}, nil
+		}, &PeriodicJobOpts{ID: "my_periodic_job_1", RunOnStart: true}))
+
+		_, err := client.PeriodicJobs().ReplaceByIDSafely("my_periodic_job_1", NewPeriodicJob(cron.Every(30*time.Minute), func() (JobArgs, *InsertOpts) {
+			return ReplacementPeriodicArgs{}, nil
+		}, &PeriodicJobOpts{ID: "my_periodic_job_1", RunOnStart: true}))
+		require.NoError(t, err)
+
+		startClient(ctx, t, client)
+
+		client.testSignals.electedLeader.WaitOrTimeout()
+
+		svc := maintenance.GetService[*maintenance.PeriodicJobEnqueuer](client.queueMaintainer)
+		svc.TestSignals.EnteredLoop.WaitOrTimeout()
+		svc.TestSignals.InsertedJobs.WaitOrTimeout()
+
+		originalJobs, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+			Kind:   []string{(OriginalPeriodicArgs{}).Kind()},
+			Schema: client.config.Schema,
+		})
+		require.NoError(t, err)
+		require.Len(t, originalJobs, 0)
+
+		replacementJobs, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+			Kind:   []string{(ReplacementPeriodicArgs{}).Kind()},
+			Schema: client.config.Schema,
+		})
+		require.NoError(t, err)
+		require.Len(t, replacementJobs, 1)
+	})
+
 	t.Run("PeriodicJobEnqueuerRemoveManyByID", func(t *testing.T) {
 		t.Parallel()
 

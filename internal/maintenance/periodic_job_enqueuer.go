@@ -120,12 +120,13 @@ type PeriodicJobEnqueuer struct {
 	Config      *PeriodicJobEnqueuerConfig
 	TestSignals PeriodicJobEnqueuerTestSignals
 
-	exec               riverdriver.Executor
-	mu                 sync.RWMutex
-	nextHandle         rivertype.PeriodicJobHandle
-	periodicJobIDs     map[string]rivertype.PeriodicJobHandle
-	periodicJobs       map[rivertype.PeriodicJobHandle]*PeriodicJob
-	recalculateNextRun chan struct{}
+	exec                        riverdriver.Executor
+	mu                          sync.RWMutex
+	nextHandle                  rivertype.PeriodicJobHandle
+	pendingDurableNextRunAtByID map[string]time.Time
+	periodicJobIDs              map[string]rivertype.PeriodicJobHandle
+	periodicJobs                map[rivertype.PeriodicJobHandle]*PeriodicJob
+	recalculateNextRun          chan struct{}
 }
 
 func NewPeriodicJobEnqueuer(archetype *baseservice.Archetype, config *PeriodicJobEnqueuerConfig, exec riverdriver.Executor) (*PeriodicJobEnqueuer, error) {
@@ -170,11 +171,12 @@ func NewPeriodicJobEnqueuer(archetype *baseservice.Archetype, config *PeriodicJo
 			Schema:             config.Schema,
 		}).mustValidate(),
 
-		exec:               exec,
-		nextHandle:         nextHandle,
-		periodicJobIDs:     periodicJobIDs,
-		periodicJobs:       periodicJobs,
-		recalculateNextRun: make(chan struct{}, 1),
+		exec:                        exec,
+		nextHandle:                  nextHandle,
+		pendingDurableNextRunAtByID: make(map[string]time.Time),
+		periodicJobIDs:              periodicJobIDs,
+		periodicJobs:                periodicJobs,
+		recalculateNextRun:          make(chan struct{}, 1),
 	})
 
 	return svc, nil
@@ -245,6 +247,7 @@ func (s *PeriodicJobEnqueuer) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.pendingDurableNextRunAtByID = make(map[string]time.Time)
 	s.periodicJobIDs = make(map[string]rivertype.PeriodicJobHandle)
 
 	// `nextHandle` is _not_ reset so that even across multiple generations of
@@ -270,6 +273,7 @@ func (s *PeriodicJobEnqueuer) RemoveByID(id string) bool {
 	defer s.mu.Unlock()
 
 	if handle, ok := s.periodicJobIDs[id]; ok {
+		delete(s.pendingDurableNextRunAtByID, id)
 		delete(s.periodicJobIDs, id)
 		delete(s.periodicJobs, handle)
 		return true
@@ -299,13 +303,141 @@ func (s *PeriodicJobEnqueuer) RemoveManyByID(ids []string) {
 
 	for _, id := range ids {
 		if handle, ok := s.periodicJobIDs[id]; ok {
+			delete(s.pendingDurableNextRunAtByID, id)
 			delete(s.periodicJobIDs, id)
 			delete(s.periodicJobs, handle)
 		}
 	}
 }
 
+// ReplaceByIDSafely replaces an existing periodic job by ID.
+//
+// Returns a new periodic job handle for the replacement job. The old periodic
+// job handle is retired and should no longer be used.
+func (s *PeriodicJobEnqueuer) ReplaceByIDSafely(id string, periodicJob *PeriodicJob) (rivertype.PeriodicJobHandle, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := periodicJob.validate(); err != nil {
+		return 0, err
+	}
+
+	oldHandle, ok := s.periodicJobIDs[id]
+	if !ok {
+		return 0, errors.New("periodic job with ID not found: " + id)
+	}
+
+	if periodicJob.ID != id {
+		return 0, fmt.Errorf("replacement periodic job ID mismatch: expected %q, got %q", id, periodicJob.ID)
+	}
+
+	delete(s.periodicJobIDs, id)
+	delete(s.periodicJobs, oldHandle)
+
+	newHandle := s.nextHandle
+	if err := addUniqueID(s.periodicJobIDs, id, newHandle); err != nil {
+		return 0, err
+	}
+
+	s.periodicJobs[newHandle] = periodicJob
+	s.nextHandle++
+
+	select {
+	case s.recalculateNextRun <- struct{}{}:
+	default:
+	}
+
+	return newHandle, nil
+}
+
+// ReplaceScheduleByIDSafely replaces only the schedule for an existing periodic
+// job by ID.
+func (s *PeriodicJobEnqueuer) ReplaceScheduleByIDSafely(id string, scheduleFunc func(time.Time) time.Time) error {
+	if scheduleFunc == nil {
+		return errors.New("PeriodicJob.ScheduleFunc must be set")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	handle, ok := s.periodicJobIDs[id]
+	if !ok {
+		return errors.New("periodic job with ID not found: " + id)
+	}
+
+	periodicJob := s.periodicJobs[handle]
+	periodicJob.ScheduleFunc = scheduleFunc
+
+	if !periodicJob.nextRunAt.IsZero() {
+		periodicJob.nextRunAt = scheduleFunc(s.Time.NowUTC())
+		s.pendingDurableNextRunAtByID[id] = periodicJob.nextRunAt
+	}
+
+	select {
+	case s.recalculateNextRun <- struct{}{}:
+	default:
+	}
+
+	return nil
+}
+
+func (s *PeriodicJobEnqueuer) flushPendingDurableNextRunAt(ctx context.Context) {
+	s.mu.RLock()
+	if len(s.pendingDurableNextRunAtByID) < 1 {
+		s.mu.RUnlock()
+		return
+	}
+
+	pendingSnapshot := make(map[string]time.Time, len(s.pendingDurableNextRunAtByID))
+	for id, nextRunAt := range s.pendingDurableNextRunAtByID {
+		pendingSnapshot[id] = nextRunAt
+	}
+	s.mu.RUnlock()
+
+	periodicJobUpsertParams := &riverpilot.PeriodicJobUpsertManyParams{
+		Schema: s.Config.Schema,
+		Jobs:   make([]*riverpilot.PeriodicJobUpsertParams, 0, len(pendingSnapshot)),
+	}
+	for id, nextRunAt := range pendingSnapshot {
+		periodicJobUpsertParams.Jobs = append(periodicJobUpsertParams.Jobs, &riverpilot.PeriodicJobUpsertParams{
+			ID:        id,
+			NextRunAt: nextRunAt,
+			UpdatedAt: s.Time.NowUTC(),
+		})
+	}
+
+	tx, err := s.exec.Begin(ctx)
+	if err != nil {
+		s.Logger.ErrorContext(ctx, s.Name+": Error starting transaction", "error", err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err = s.Config.Pilot.PeriodicJobUpsertMany(ctx, tx, periodicJobUpsertParams); err != nil {
+		s.Logger.ErrorContext(ctx, s.Name+": Error upserting periodic job next run times",
+			"error", err.Error(), "num_jobs", 0, "num_next_run_at_upserts", len(periodicJobUpsertParams.Jobs))
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		s.Logger.ErrorContext(ctx, s.Name+": Error committing transaction", "error", err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	for id, snapshotNextRunAt := range pendingSnapshot {
+		currentNextRunAt, ok := s.pendingDurableNextRunAtByID[id]
+		if ok && currentNextRunAt.Equal(snapshotNextRunAt) {
+			delete(s.pendingDurableNextRunAtByID, id)
+		}
+	}
+	s.mu.Unlock()
+
+	s.TestSignals.PeriodicJobUpserted.Signal(struct{}{})
+}
+
 func (s *PeriodicJobEnqueuer) removeJobLockFree(periodicJob *PeriodicJob, periodicJobHandle rivertype.PeriodicJobHandle) {
+	delete(s.pendingDurableNextRunAtByID, periodicJob.ID)
 	delete(s.periodicJobs, periodicJobHandle)
 	delete(s.periodicJobIDs, periodicJob.ID)
 }
@@ -497,6 +629,8 @@ func (s *PeriodicJobEnqueuer) Start(ctx context.Context) error {
 			// Insert any RunOnStart initial runs for new jobs that've been
 			// added since the last run loop.
 			validateInsertRunOnStartAndScheduleNewlyAdded()
+
+			s.flushPendingDurableNextRunAt(ctx)
 
 			// Reset the timer after the insert loop has finished so it's
 			// paused during work. Makes its firing more deterministic.

@@ -141,6 +141,91 @@ func TestPeriodicJobBundle(t *testing.T) {
 		_, err := periodicJobBundle.AddManySafely([]*PeriodicJob{periodicJob})
 		require.EqualError(t, err, "periodic job with ID already registered: periodic_job_id")
 	})
+
+	t.Run("ReplaceByID", func(t *testing.T) {
+		t.Parallel()
+
+		periodicJobBundle, _ := setup(t)
+
+		original := NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "periodic_job_id"},
+		)
+		originalHandle := periodicJobBundle.Add(original)
+
+		replacement := NewPeriodicJob(
+			PeriodicInterval(30*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "periodic_job_id"},
+		)
+
+		replacementHandle, err := periodicJobBundle.ReplaceByIDSafely("periodic_job_id", replacement)
+		require.NoError(t, err)
+		require.NotEqual(t, originalHandle, replacementHandle)
+
+		_, err = periodicJobBundle.AddSafely(original)
+		require.EqualError(t, err, "periodic job with ID already registered: periodic_job_id")
+	})
+
+	t.Run("ReplaceByIDError", func(t *testing.T) {
+		t.Parallel()
+
+		periodicJobBundle, _ := setup(t)
+
+		periodicJobBundle.Add(NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "periodic_job_id"},
+		))
+
+		_, err := periodicJobBundle.ReplaceByIDSafely("does_not_exist", NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "does_not_exist"},
+		))
+		require.EqualError(t, err, "periodic job with ID not found: does_not_exist")
+
+		_, err = periodicJobBundle.ReplaceByIDSafely("periodic_job_id", NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			nil,
+		))
+		require.EqualError(t, err, "replacement periodic job ID mismatch: expected \"periodic_job_id\", got \"\"")
+	})
+
+	t.Run("ReplaceScheduleByID", func(t *testing.T) {
+		t.Parallel()
+
+		periodicJobBundle, _ := setup(t)
+
+		periodicJobBundle.Add(NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "periodic_job_id"},
+		))
+
+		err := periodicJobBundle.ReplaceScheduleByIDSafely("periodic_job_id", PeriodicInterval(30*time.Minute))
+		require.NoError(t, err)
+	})
+
+	t.Run("ReplaceScheduleByIDError", func(t *testing.T) {
+		t.Parallel()
+
+		periodicJobBundle, _ := setup(t)
+
+		periodicJobBundle.Add(NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "periodic_job_id"},
+		))
+
+		err := periodicJobBundle.ReplaceScheduleByIDSafely("does_not_exist", PeriodicInterval(30*time.Minute))
+		require.EqualError(t, err, "periodic job with ID not found: does_not_exist")
+
+		err = periodicJobBundle.ReplaceScheduleByIDSafely("periodic_job_id", nil)
+		require.EqualError(t, err, "PeriodicSchedule must be set")
+	})
 }
 
 func mustUnmarshalJSON[T any](t *testing.T, data []byte) *T {

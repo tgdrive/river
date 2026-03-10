@@ -628,6 +628,190 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		require.Len(t, svc.periodicJobs, 1)
 	})
 
+	t.Run("ReplaceByID", func(t *testing.T) {
+		t.Parallel()
+
+		svc, _ := setup(t)
+
+		handleOriginal, err := svc.AddSafely(&PeriodicJob{
+			ID:              "periodic_job_500ms",
+			ScheduleFunc:    periodicIntervalSchedule(500 * time.Millisecond),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false),
+		})
+		require.NoError(t, err)
+
+		handleReplacement, err := svc.ReplaceByIDSafely("periodic_job_500ms", &PeriodicJob{
+			ID:              "periodic_job_500ms",
+			ScheduleFunc:    periodicIntervalSchedule(time.Second),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms_replacement", false),
+			RunOnStart:      true,
+		})
+		require.NoError(t, err)
+		require.NotEqual(t, handleOriginal, handleReplacement)
+		require.Equal(t, handleReplacement, svc.periodicJobIDs["periodic_job_500ms"])
+		require.NotContains(t, svc.periodicJobs, handleOriginal)
+		require.Contains(t, svc.periodicJobs, handleReplacement)
+	})
+
+	t.Run("ReplaceByIDError", func(t *testing.T) {
+		t.Parallel()
+
+		svc, _ := setup(t)
+
+		_, err := svc.AddSafely(&PeriodicJob{
+			ID:              "periodic_job_500ms",
+			ScheduleFunc:    periodicIntervalSchedule(500 * time.Millisecond),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false),
+		})
+		require.NoError(t, err)
+
+		_, err = svc.ReplaceByIDSafely("does_not_exist", &PeriodicJob{
+			ID:              "does_not_exist",
+			ScheduleFunc:    periodicIntervalSchedule(500 * time.Millisecond),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false),
+		})
+		require.EqualError(t, err, "periodic job with ID not found: does_not_exist")
+
+		_, err = svc.ReplaceByIDSafely("periodic_job_500ms", &PeriodicJob{
+			ID:              "other_id",
+			ScheduleFunc:    periodicIntervalSchedule(500 * time.Millisecond),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false),
+		})
+		require.EqualError(t, err, "replacement periodic job ID mismatch: expected \"periodic_job_500ms\", got \"other_id\"")
+	})
+
+	t.Run("ReplaceScheduleByID", func(t *testing.T) {
+		t.Parallel()
+
+		svc, bundle := setup(t)
+
+		var (
+			upsertMu    sync.Mutex
+			upsertCalls int
+			lastNextRun time.Time
+		)
+		bundle.pilotMock.PeriodicJobUpsertManyMock = func(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobUpsertManyParams) ([]*riverpilot.PeriodicJob, error) {
+			upsertMu.Lock()
+			defer upsertMu.Unlock()
+
+			upsertCalls++
+			for _, job := range params.Jobs {
+				if job.ID == "periodic_job_500ms" {
+					lastNextRun = job.NextRunAt
+				}
+			}
+
+			return nil, nil
+		}
+
+		handle, err := svc.AddSafely(&PeriodicJob{
+			ID:              "periodic_job_500ms",
+			ScheduleFunc:    periodicIntervalSchedule(500 * time.Millisecond),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false),
+		})
+		require.NoError(t, err)
+
+		startService(t, svc)
+		svc.TestSignals.EnteredLoop.WaitOrTimeout()
+		svc.TestSignals.PeriodicJobUpserted.WaitOrTimeout() // initial schedule upsert
+
+		base := time.Now().UTC()
+		require.Equal(t, 500*time.Millisecond, svc.periodicJobs[handle].ScheduleFunc(base).Sub(base))
+
+		replaceAt := time.Now().UTC()
+		err = svc.ReplaceScheduleByIDSafely("periodic_job_500ms", periodicIntervalSchedule(time.Second))
+		require.NoError(t, err)
+		svc.TestSignals.PeriodicJobUpserted.WaitOrTimeout()
+		require.Equal(t, handle, svc.periodicJobIDs["periodic_job_500ms"])
+		require.Equal(t, time.Second, svc.periodicJobs[handle].ScheduleFunc(base).Sub(base))
+
+		upsertMu.Lock()
+		require.GreaterOrEqual(t, upsertCalls, 2)
+		require.WithinDuration(t, replaceAt.Add(time.Second), lastNextRun, 250*time.Millisecond)
+		upsertMu.Unlock()
+	})
+
+	t.Run("ReplaceScheduleByIDError", func(t *testing.T) {
+		t.Parallel()
+
+		svc, _ := setup(t)
+
+		_, err := svc.AddSafely(&PeriodicJob{
+			ID:              "periodic_job_500ms",
+			ScheduleFunc:    periodicIntervalSchedule(500 * time.Millisecond),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false),
+		})
+		require.NoError(t, err)
+
+		err = svc.ReplaceScheduleByIDSafely("does_not_exist", periodicIntervalSchedule(time.Second))
+		require.EqualError(t, err, "periodic job with ID not found: does_not_exist")
+
+		err = svc.ReplaceScheduleByIDSafely("periodic_job_500ms", nil)
+		require.EqualError(t, err, "PeriodicJob.ScheduleFunc must be set")
+	})
+
+	t.Run("RemoveClearsPendingDurableUpdate", func(t *testing.T) {
+		t.Parallel()
+
+		svc, _ := setup(t)
+
+		handle, err := svc.AddSafely(&PeriodicJob{
+			ID:              "periodic_job_500ms",
+			ScheduleFunc:    periodicIntervalSchedule(500 * time.Millisecond),
+			ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false),
+		})
+		require.NoError(t, err)
+
+		svc.pendingDurableNextRunAtByID["periodic_job_500ms"] = time.Now().UTC()
+
+		svc.Remove(handle)
+
+		require.NotContains(t, svc.pendingDurableNextRunAtByID, "periodic_job_500ms")
+	})
+
+	t.Run("ClearClearsPendingDurableUpdates", func(t *testing.T) {
+		t.Parallel()
+
+		svc, _ := setup(t)
+
+		_, err := svc.AddManySafely([]*PeriodicJob{
+			{ID: "periodic_job_500ms", ScheduleFunc: periodicIntervalSchedule(500 * time.Millisecond), ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false)},
+			{ID: "periodic_job_1s", ScheduleFunc: periodicIntervalSchedule(time.Second), ConstructorFunc: jobConstructorFunc("periodic_job_1s", false)},
+		})
+		require.NoError(t, err)
+
+		svc.pendingDurableNextRunAtByID["periodic_job_500ms"] = time.Now().UTC()
+		svc.pendingDurableNextRunAtByID["periodic_job_1s"] = time.Now().UTC()
+
+		svc.Clear()
+
+		require.Empty(t, svc.pendingDurableNextRunAtByID)
+	})
+
+	t.Run("FlushPendingDurableNextRunAtRetainsOnError", func(t *testing.T) {
+		t.Parallel()
+
+		svc, bundle := setup(t)
+
+		nextRunAt := time.Now().UTC().Add(time.Minute)
+		svc.pendingDurableNextRunAtByID["periodic_job_500ms"] = nextRunAt
+
+		var calls int
+		bundle.pilotMock.PeriodicJobUpsertManyMock = func(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobUpsertManyParams) ([]*riverpilot.PeriodicJob, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("upsert failed")
+			}
+			return nil, nil
+		}
+
+		svc.flushPendingDurableNextRunAt(ctx)
+		require.Contains(t, svc.pendingDurableNextRunAtByID, "periodic_job_500ms")
+
+		svc.flushPendingDurableNextRunAt(ctx)
+		require.NotContains(t, svc.pendingDurableNextRunAtByID, "periodic_job_500ms")
+	})
+
 	t.Run("RemoveManyAfterStart", func(t *testing.T) {
 		t.Parallel()
 
