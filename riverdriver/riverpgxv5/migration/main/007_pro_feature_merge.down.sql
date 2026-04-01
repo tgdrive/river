@@ -2,7 +2,7 @@ DROP INDEX IF EXISTS river_job_sequence_key_idx;
 DROP INDEX IF EXISTS river_job_workflow_task_name_idx;
 DROP INDEX IF EXISTS river_job_workflow_id_idx;
 
-DROP FUNCTION IF EXISTS /* TEMPLATE: schema */river_job_get_available_limited_ids(text, timestamptz, integer, integer, integer, integer, text, boolean);
+DROP FUNCTION IF EXISTS /* TEMPLATE: schema */river_job_get_available_limited_ids(text, timestamptz, integer, integer, integer, integer, text, text[], text[], boolean);
 
 ALTER TABLE /* TEMPLATE: schema */river_job
     DROP COLUMN IF EXISTS batch_id,

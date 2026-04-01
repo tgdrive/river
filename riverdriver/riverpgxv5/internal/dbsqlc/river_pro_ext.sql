@@ -99,11 +99,23 @@ WHERE j.id = c.id
 RETURNING j.id;
 
 -- name: JobGetAvailablePartitionKeys :many
-SELECT DISTINCT coalesce(sequence_key, metadata->>'sequence_key', '')
+SELECT DISTINCT concat(
+    CASE WHEN @partition_by_kind::boolean THEN kind ELSE '' END,
+    '|',
+    CASE
+        WHEN @partition_by_args::text[] IS NULL THEN ''
+        WHEN cardinality(@partition_by_args::text[]) = 0 THEN args::jsonb::text
+        ELSE coalesce((
+            SELECT jsonb_object_agg(key, args->key ORDER BY key)
+            FROM unnest(@partition_by_args::text[]) AS key
+            WHERE args ? key
+        ), '{}'::jsonb)::text
+    END
+)
 FROM /* TEMPLATE: schema */river_job
 WHERE queue = @queue
   AND state = 'available'
-  AND coalesce(sequence_key, metadata->>'sequence_key') IS NOT NULL;
+  AND scheduled_at <= coalesce(sqlc.narg('now')::timestamptz, now());
 
 CREATE OR REPLACE FUNCTION river_job_get_available_limited_ids(
     p_queue text,
@@ -113,17 +125,35 @@ CREATE OR REPLACE FUNCTION river_job_get_available_limited_ids(
     p_max_to_lock integer,
     p_max_attempted_by integer,
     p_attempted_by text,
+    p_available_partition_keys text[],
+    p_partition_by_args text[],
     p_partition_by_kind boolean
 )
 RETURNS TABLE(id bigint)
 LANGUAGE sql
 AS $$
-WITH running AS (
+WITH fetch_lock AS (
+    SELECT pg_advisory_xact_lock(hashtext(p_queue), 0)
+),
+running AS (
     SELECT
-        CASE WHEN p_partition_by_kind THEN kind ELSE '' END AS partition_key,
+        concat(
+            CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+            '|',
+            CASE
+                WHEN p_partition_by_args IS NULL THEN ''
+                WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                ELSE coalesce((
+                    SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                    FROM unnest(p_partition_by_args) AS key
+                    WHERE args ? key
+                ), '{}'::jsonb)::text
+            END
+        ) AS partition_key,
         count(*) AS global_running,
         count(*) FILTER (WHERE attempted_by[array_length(attempted_by, 1)] = p_attempted_by) AS local_running
     FROM river_job
+    CROSS JOIN fetch_lock
     WHERE queue = p_queue
       AND state = 'running'
     GROUP BY 1
@@ -133,15 +163,53 @@ available_ranked AS (
         id,
         priority,
         scheduled_at,
-        CASE WHEN p_partition_by_kind THEN kind ELSE '' END AS partition_key,
+        concat(
+            CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+            '|',
+            CASE
+                WHEN p_partition_by_args IS NULL THEN ''
+                WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                ELSE coalesce((
+                    SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                    FROM unnest(p_partition_by_args) AS key
+                    WHERE args ? key
+                ), '{}'::jsonb)::text
+            END
+        ) AS partition_key,
         row_number() OVER (
-            PARTITION BY CASE WHEN p_partition_by_kind THEN kind ELSE '' END
+            PARTITION BY concat(
+                CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+                '|',
+                CASE
+                    WHEN p_partition_by_args IS NULL THEN ''
+                    WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                    ELSE coalesce((
+                        SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                        FROM unnest(p_partition_by_args) AS key
+                        WHERE args ? key
+                    ), '{}'::jsonb)::text
+                END
+            )
             ORDER BY priority ASC, scheduled_at ASC, id ASC
         ) AS partition_rank
     FROM river_job
+    CROSS JOIN fetch_lock
     WHERE queue = p_queue
       AND state = 'available'
       AND scheduled_at <= p_now
+      AND (p_available_partition_keys IS NULL OR concat(
+            CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+            '|',
+            CASE
+                WHEN p_partition_by_args IS NULL THEN ''
+                WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                ELSE coalesce((
+                    SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                    FROM unnest(p_partition_by_args) AS key
+                    WHERE args ? key
+                ), '{}'::jsonb)::text
+            END
+        ) = any(p_available_partition_keys))
 ),
 eligible_ids AS (
     SELECT a.id, a.priority, a.scheduled_at
@@ -176,7 +244,7 @@ WHERE j.id = c.id
 RETURNING j.id;
 $$;
 
--- name: JobGetAvailableLimitedByKind :many
+-- name: JobGetAvailableLimited :many
 SELECT *
 FROM /* TEMPLATE: schema */river_job_get_available_limited_ids(
     @queue,
@@ -186,6 +254,8 @@ FROM /* TEMPLATE: schema */river_job_get_available_limited_ids(
     @max_to_lock,
     @max_attempted_by,
     @attempted_by,
+    @available_partition_keys::text[],
+    @partition_by_args::text[],
     @partition_by_kind
 );
 
@@ -291,18 +361,40 @@ ORDER BY updated_at DESC
 LIMIT @max;
 
 -- name: SequencePromote :many
+WITH promotable AS (
+    SELECT j.id, j.queue
+    FROM /* TEMPLATE: schema */river_job j
+    WHERE j.queue = @queue
+      AND j.state = 'pending'
+      AND coalesce(j.sequence_key, j.metadata->>'sequence_key') IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM /* TEMPLATE: schema */river_job prev
+        WHERE prev.queue = j.queue
+          AND coalesce(prev.sequence_key, prev.metadata->>'sequence_key') = coalesce(j.sequence_key, j.metadata->>'sequence_key')
+          AND prev.id < j.id
+          AND (
+            prev.state IN ('available', 'pending', 'retryable', 'running', 'scheduled')
+            OR (prev.state = 'cancelled' AND NOT coalesce((j.metadata->>'sequence_continue_on_cancelled')::boolean, false))
+            OR (prev.state = 'discarded' AND NOT coalesce((j.metadata->>'sequence_continue_on_discarded')::boolean, false))
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM /* TEMPLATE: schema */river_job same_seq_pending
+        WHERE same_seq_pending.queue = j.queue
+          AND same_seq_pending.state = 'pending'
+          AND coalesce(same_seq_pending.sequence_key, same_seq_pending.metadata->>'sequence_key') = coalesce(j.sequence_key, j.metadata->>'sequence_key')
+          AND same_seq_pending.id < j.id
+      )
+    ORDER BY j.id ASC
+    LIMIT @max
+)
 UPDATE /* TEMPLATE: schema */river_job j
 SET state = 'available',
     scheduled_at = now()
-WHERE j.id IN (
-    SELECT id
-    FROM /* TEMPLATE: schema */river_job rj
-    WHERE rj.queue = @queue
-      AND rj.state = 'pending'
-      AND coalesce(rj.sequence_key, rj.metadata->>'sequence_key') IS NOT NULL
-    ORDER BY id ASC
-    LIMIT @max
-)
+FROM promotable
+WHERE j.id = promotable.id
 RETURNING j.queue;
 
 -- name: SequencePromoteFromTable :many
@@ -323,6 +415,17 @@ RETURNING id;
 UPDATE /* TEMPLATE: schema */river_job
 SET state = 'cancelled',
     finalized_at = now()
+WHERE id = any(@ids::bigint[])
+  AND state IN ('available', 'pending', 'retryable', 'scheduled')
+RETURNING id;
+
+-- name: WorkflowCancelWithFailedDepsByIDs :many
+UPDATE /* TEMPLATE: schema */river_job
+SET state = 'cancelled',
+    finalized_at = coalesce(sqlc.narg('workflow_deps_failed_at')::timestamptz, now()),
+    metadata = metadata || jsonb_build_object(
+        'workflow_deps_failed_at', to_jsonb(coalesce(sqlc.narg('workflow_deps_failed_at')::timestamptz, now()))
+    )
 WHERE id = any(@ids::bigint[])
   AND state IN ('available', 'pending', 'retryable', 'scheduled')
 RETURNING id;
@@ -408,13 +511,25 @@ FROM /* TEMPLATE: schema */river_job
 WHERE coalesce(workflow_id, metadata->>'workflow_id') = @workflow_id
   AND coalesce(workflow_task_name, metadata->>'workflow_task_name') = any(@task_names::text[]);
 
--- name: WorkflowRetry :many
+-- name: WorkflowRetryByIDMany :many
 UPDATE /* TEMPLATE: schema */river_job
 SET state = 'available',
+    attempt = CASE WHEN @reset_history::boolean THEN 0 ELSE attempt END,
+    attempted_at = CASE WHEN @reset_history::boolean THEN NULL ELSE attempted_at END,
+    attempted_by = CASE WHEN @reset_history::boolean THEN NULL ELSE attempted_by END,
+    errors = CASE WHEN @reset_history::boolean THEN '{}'::jsonb[] ELSE errors END,
     finalized_at = NULL,
-    scheduled_at = now()
-WHERE coalesce(workflow_id, metadata->>'workflow_id') = @workflow_id
-  AND state IN ('cancelled','discarded')
+    max_attempts = CASE WHEN @reset_history::boolean THEN max_attempts WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
+    metadata = CASE WHEN @reset_history::boolean THEN metadata - 'output' ELSE metadata END,
+    scheduled_at = coalesce(sqlc.narg('now')::timestamptz, now())
+WHERE id = any(@ids::bigint[])
+RETURNING id;
+
+-- name: WorkflowSetPendingByIDMany :many
+UPDATE /* TEMPLATE: schema */river_job
+SET state = 'pending'
+WHERE id = any(@ids::bigint[])
+  AND state = 'available'
 RETURNING id;
 
 -- name: WorkflowCountRunning :one

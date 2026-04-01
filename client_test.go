@@ -4975,6 +4975,53 @@ func Test_Client_Maintenance(t *testing.T) {
 		require.NotErrorIs(t, err, ErrNotFound) // still there
 	})
 
+	t.Run("JobCleanerCleansPerQueueRetention", func(t *testing.T) {
+		t.Parallel()
+
+		config := newTestConfig(t, "")
+		config.CancelledJobRetentionPeriod = 24 * time.Hour
+		config.CompletedJobRetentionPeriod = 24 * time.Hour
+		config.DiscardedJobRetentionPeriod = 24 * time.Hour
+		config.Queues = map[string]QueueConfig{
+			QueueDefault: {MaxWorkers: 1},
+			"queue_fast": {
+				CancelledJobRetentionPeriod: 1 * time.Hour,
+				CompletedJobRetentionPeriod: 1 * time.Hour,
+				DiscardedJobRetentionPeriod: 1 * time.Hour,
+				MaxWorkers:                  1,
+			},
+		}
+
+		client, bundle := setup(t, config)
+
+		deleteHorizon := time.Now().Add(-2 * time.Hour)
+		queueFast := "queue_fast"
+
+		fastCancelled := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{Schema: bundle.schema, Queue: ptrutil.Ptr(queueFast), State: ptrutil.Ptr(rivertype.JobStateCancelled), FinalizedAt: ptrutil.Ptr(deleteHorizon)})
+		fastCompleted := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{Schema: bundle.schema, Queue: ptrutil.Ptr(queueFast), State: ptrutil.Ptr(rivertype.JobStateCompleted), FinalizedAt: ptrutil.Ptr(deleteHorizon)})
+		fastDiscarded := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{Schema: bundle.schema, Queue: ptrutil.Ptr(queueFast), State: ptrutil.Ptr(rivertype.JobStateDiscarded), FinalizedAt: ptrutil.Ptr(deleteHorizon)})
+
+		defaultCancelled := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{Schema: bundle.schema, State: ptrutil.Ptr(rivertype.JobStateCancelled), FinalizedAt: ptrutil.Ptr(deleteHorizon)})
+		defaultCompleted := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{Schema: bundle.schema, State: ptrutil.Ptr(rivertype.JobStateCompleted), FinalizedAt: ptrutil.Ptr(deleteHorizon)})
+		defaultDiscarded := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{Schema: bundle.schema, State: ptrutil.Ptr(rivertype.JobStateDiscarded), FinalizedAt: ptrutil.Ptr(deleteHorizon)})
+
+		startAndWaitForQueueMaintainer(ctx, t, client)
+
+		require.Eventually(t, func() bool {
+			_, err1 := client.JobGet(ctx, fastCancelled.ID)
+			_, err2 := client.JobGet(ctx, fastCompleted.ID)
+			_, err3 := client.JobGet(ctx, fastDiscarded.ID)
+			return errors.Is(err1, ErrNotFound) && errors.Is(err2, ErrNotFound) && errors.Is(err3, ErrNotFound)
+		}, 10*time.Second, 50*time.Millisecond)
+
+		_, err := client.JobGet(ctx, defaultCancelled.ID)
+		require.NotErrorIs(t, err, ErrNotFound)
+		_, err = client.JobGet(ctx, defaultCompleted.ID)
+		require.NotErrorIs(t, err, ErrNotFound)
+		_, err = client.JobGet(ctx, defaultDiscarded.ID)
+		require.NotErrorIs(t, err, ErrNotFound)
+	})
+
 	t.Run("JobRescuer", func(t *testing.T) {
 		t.Parallel()
 
@@ -7588,6 +7635,22 @@ func Test_NewClient_Validations(t *testing.T) {
 			},
 		},
 		{
+			name: "PartitionKeyCacheTTL may be disabled with -1",
+			configFunc: func(config *Config) {
+				config.PartitionKeyCacheTTL = -1
+			},
+			validateResult: func(t *testing.T, client *Client[pgx.Tx]) { //nolint:thelper
+				require.Equal(t, time.Duration(-1), client.config.PartitionKeyCacheTTL)
+			},
+		},
+		{
+			name: "PartitionKeyCacheTTL less than -1 is invalid",
+			configFunc: func(config *Config) {
+				config.PartitionKeyCacheTTL = -2
+			},
+			wantErr: errors.New("PartitionKeyCacheTTL cannot be less than zero, except for -1 (disabled)"),
+		},
+		{
 			name: "Schema length must be less than or equal to 46 characters",
 			configFunc: func(config *Config) {
 				config.Schema = strings.Repeat("a", 47)
@@ -7650,6 +7713,13 @@ func Test_NewClient_Validations(t *testing.T) {
 				config.Queues = map[string]QueueConfig{QueueDefault: {MaxWorkers: -1}}
 			},
 			wantErr: errors.New("invalid number of workers for queue \"default\": -1"),
+		},
+		{
+			name: "Queues concurrency must specify a limit",
+			configFunc: func(config *Config) {
+				config.Queues = map[string]QueueConfig{QueueDefault: {Concurrency: &ConcurrencyConfig{}, MaxWorkers: 1}}
+			},
+			wantErr: errors.New("Concurrency must specify at least one of GlobalLimit or LocalLimit"),
 		},
 		{
 			name: "Queues can't have limits larger than MaxQueueNumWorkers",

@@ -62,17 +62,35 @@ CREATE OR REPLACE FUNCTION /* TEMPLATE: schema */river_job_get_available_limited
     p_max_to_lock integer,
     p_max_attempted_by integer,
     p_attempted_by text,
+    p_available_partition_keys text[],
+    p_partition_by_args text[],
     p_partition_by_kind boolean
 )
 RETURNS TABLE(id bigint)
 LANGUAGE sql
 AS $$
-WITH running AS (
+WITH fetch_lock AS (
+    SELECT pg_advisory_xact_lock(hashtext(p_queue), 0)
+),
+running AS (
     SELECT
-        CASE WHEN p_partition_by_kind THEN kind ELSE '' END AS partition_key,
+        concat(
+            CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+            '|',
+            CASE
+                WHEN p_partition_by_args IS NULL THEN ''
+                WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                ELSE coalesce((
+                    SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                    FROM unnest(p_partition_by_args) AS key
+                    WHERE args ? key
+                ), '{}'::jsonb)::text
+            END
+        ) AS partition_key,
         count(*) AS global_running,
         count(*) FILTER (WHERE attempted_by[array_length(attempted_by, 1)] = p_attempted_by) AS local_running
     FROM /* TEMPLATE: schema */river_job
+    CROSS JOIN fetch_lock
     WHERE queue = p_queue
       AND state = 'running'
     GROUP BY 1
@@ -82,15 +100,53 @@ available_ranked AS (
         id,
         priority,
         scheduled_at,
-        CASE WHEN p_partition_by_kind THEN kind ELSE '' END AS partition_key,
+        concat(
+            CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+            '|',
+            CASE
+                WHEN p_partition_by_args IS NULL THEN ''
+                WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                ELSE coalesce((
+                    SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                    FROM unnest(p_partition_by_args) AS key
+                    WHERE args ? key
+                ), '{}'::jsonb)::text
+            END
+        ) AS partition_key,
         row_number() OVER (
-            PARTITION BY CASE WHEN p_partition_by_kind THEN kind ELSE '' END
+            PARTITION BY concat(
+                CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+                '|',
+                CASE
+                    WHEN p_partition_by_args IS NULL THEN ''
+                    WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                    ELSE coalesce((
+                        SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                        FROM unnest(p_partition_by_args) AS key
+                        WHERE args ? key
+                    ), '{}'::jsonb)::text
+                END
+            )
             ORDER BY priority ASC, scheduled_at ASC, id ASC
         ) AS partition_rank
     FROM /* TEMPLATE: schema */river_job
+    CROSS JOIN fetch_lock
     WHERE queue = p_queue
       AND state = 'available'
       AND scheduled_at <= p_now
+      AND (p_available_partition_keys IS NULL OR concat(
+            CASE WHEN p_partition_by_kind THEN kind ELSE '' END,
+            '|',
+            CASE
+                WHEN p_partition_by_args IS NULL THEN ''
+                WHEN cardinality(p_partition_by_args) = 0 THEN args::jsonb::text
+                ELSE coalesce((
+                    SELECT jsonb_object_agg(key, args->key ORDER BY key)
+                    FROM unnest(p_partition_by_args) AS key
+                    WHERE args ? key
+                ), '{}'::jsonb)::text
+            END
+        ) = any(p_available_partition_keys))
 ),
 eligible_ids AS (
     SELECT a.id, a.priority, a.scheduled_at

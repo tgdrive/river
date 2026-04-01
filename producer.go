@@ -113,6 +113,7 @@ type producerConfig struct {
 	SchedulerInterval            time.Duration
 	Schema                       string
 	StaleProducerRetentionPeriod time.Duration
+	PartitionKeyCacheTTL         time.Duration
 	PartitionByArgs              []string
 	PartitionByKind              bool
 	Workers                      *Workers
@@ -215,8 +216,12 @@ type producer struct {
 	numJobsActive atomic.Int32
 	numJobsStuck  atomic.Int32
 
-	numJobsRan atomic.Uint64
-	paused     bool
+	numJobsRan        atomic.Uint64
+	paused            bool
+	partitionKeyCache struct {
+		expiresAt time.Time
+		keys      []string
+	}
 	// Receives control messages from the notifier goroutine. Written by notifier
 	// goroutine, only read from main goroutine.
 	queueControlCh chan *controlEventPayload
@@ -357,6 +362,7 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 			if decoded.Queue != p.config.Queue {
 				return
 			}
+			p.partitionKeyCache.expiresAt = time.Time{}
 			p.Logger.DebugContext(workCtx, p.Name+": Received insert notification", slog.String("queue", decoded.Queue))
 			p.fetchLimiter.Call()
 		}
@@ -761,18 +767,25 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 	// rarely hit, but exists to protect against degenerate cases.
 	const maxAttemptedBy = 100
 
+	availablePartitionKeys, err := p.getAvailablePartitionKeys(ctx)
+	if err != nil {
+		fetchResultCh <- producerFetchResult{err: err}
+		return
+	}
+
 	jobs, err := p.pilot.JobGetAvailable(ctx, p.exec, p.state, &riverdriver.JobGetAvailableParams{
-		ClientID:        p.config.ClientID,
-		GlobalLimit:     p.config.GlobalLimit,
-		LocalLimit:      p.config.LocalLimit,
-		MaxAttemptedBy:  maxAttemptedBy,
-		MaxToLock:       count,
-		Now:             p.Time.NowUTCOrNil(),
-		PartitionByArgs: p.config.PartitionByArgs,
-		PartitionByKind: p.config.PartitionByKind,
-		Queue:           p.config.Queue,
-		ProducerID:      p.id.Load(),
-		Schema:          p.config.Schema,
+		AvailablePartitionKeys: availablePartitionKeys,
+		ClientID:               p.config.ClientID,
+		GlobalLimit:            p.config.GlobalLimit,
+		LocalLimit:             p.config.LocalLimit,
+		MaxAttemptedBy:         maxAttemptedBy,
+		MaxToLock:              count,
+		Now:                    p.Time.NowUTCOrNil(),
+		PartitionByArgs:        p.config.PartitionByArgs,
+		PartitionByKind:        p.config.PartitionByKind,
+		Queue:                  p.config.Queue,
+		ProducerID:             p.id.Load(),
+		Schema:                 p.config.Schema,
 	})
 	if err != nil {
 		fetchResultCh <- producerFetchResult{err: err}
@@ -780,6 +793,31 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 	}
 
 	fetchResultCh <- producerFetchResult{jobs: jobs}
+}
+
+func (p *producer) getAvailablePartitionKeys(ctx context.Context) ([]string, error) {
+	if (!p.config.PartitionByKind && p.config.PartitionByArgs == nil) || p.config.PartitionKeyCacheTTL == -1 || p.config.PartitionKeyCacheTTL < p.config.FetchCooldown {
+		return nil, nil
+	}
+	now := p.Time.NowUTC()
+	if now.Before(p.partitionKeyCache.expiresAt) {
+		return p.partitionKeyCache.keys, nil
+	}
+	keys, err := p.exec.JobGetAvailablePartitionKeys(ctx, &riverdriver.JobGetAvailablePartitionKeysParams{
+		PartitionByArgs: p.config.PartitionByArgs,
+		PartitionByKind: p.config.PartitionByKind,
+		Queue:           p.config.Queue,
+		Schema:          p.config.Schema,
+	})
+	if err != nil {
+		if errors.Is(err, riverdriver.ErrNotImplemented) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	p.partitionKeyCache.keys = keys
+	p.partitionKeyCache.expiresAt = now.Add(p.config.PartitionKeyCacheTTL)
+	return keys, nil
 }
 
 // Periodically logs an informational log line giving some insight into the

@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
+	"github.com/riverqueue/river/internal/notifier"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivertype"
@@ -15,6 +17,7 @@ import (
 
 type StandardPilot struct {
 	durablePeriodicJobsEnabled atomic.Bool
+	notifyNonTxJobInsert       func(ctx context.Context, res []*rivertype.JobInsertResult)
 	seq                        atomic.Int64
 }
 
@@ -31,17 +34,18 @@ func (p *StandardPilot) JobGetAvailable(ctx context.Context, exec riverdriver.Ex
 	}
 
 	jobs, err := exec.JobGetAvailableLimited(ctx, &riverdriver.JobGetAvailableLimitedParams{
-		ClientID:        params.ClientID,
-		GlobalLimit:     params.GlobalLimit,
-		LocalLimit:      params.LocalLimit,
-		MaxAttemptedBy:  params.MaxAttemptedBy,
-		MaxToLock:       params.MaxToLock,
-		Now:             params.Now,
-		PartitionByArgs: params.PartitionByArgs,
-		PartitionByKind: params.PartitionByKind,
-		ProducerID:      producerID,
-		Queue:           params.Queue,
-		Schema:          params.Schema,
+		AvailablePartitionKeys: params.AvailablePartitionKeys,
+		ClientID:               params.ClientID,
+		GlobalLimit:            params.GlobalLimit,
+		LocalLimit:             params.LocalLimit,
+		MaxAttemptedBy:         params.MaxAttemptedBy,
+		MaxToLock:              params.MaxToLock,
+		Now:                    params.Now,
+		PartitionByArgs:        params.PartitionByArgs,
+		PartitionByKind:        params.PartitionByKind,
+		ProducerID:             producerID,
+		Queue:                  params.Queue,
+		Schema:                 params.Schema,
 	})
 	if errors.Is(err, riverdriver.ErrNotImplemented) {
 		jobs, err = exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
@@ -69,7 +73,14 @@ func (p *StandardPilot) JobInsertMany(
 	exec riverdriver.Executor,
 	params *riverdriver.JobInsertFastManyParams,
 ) ([]*riverdriver.JobInsertFastResult, error) {
-	return exec.JobInsertFastMany(ctx, params)
+	results, err := exec.JobInsertFastMany(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	if err := appendAndPromoteSequences(ctx, exec, params.Schema, results, params.Jobs, p.notifyNonTxJobInsert); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 func (p *StandardPilot) JobRetry(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRetryParams) (*rivertype.JobRow, error) {
@@ -83,33 +94,38 @@ func (p *StandardPilot) JobSetStateIfRunningMany(ctx context.Context, exec river
 	}
 
 	var (
-		ephemeralIDs []int64
-		workflowIDs  = make(map[string]struct{})
+		ephemeralIDs   []int64
+		sequenceQueues = make(map[string]struct{})
+		workflowIDs    = make(map[string]struct{})
 	)
 
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
-		if job.State != rivertype.JobStateCompleted {
-			continue
-		}
 		if len(job.Metadata) == 0 || bytes.Equal(job.Metadata, []byte("{}")) {
 			continue
 		}
-		if !bytes.Contains(job.Metadata, []byte("\"ephemeral\"")) && !bytes.Contains(job.Metadata, []byte("\"workflow_id\"")) {
+		if !bytes.Contains(job.Metadata, []byte("\"ephemeral\"")) && !bytes.Contains(job.Metadata, []byte("\"workflow_id\"")) && !bytes.Contains(job.Metadata, []byte("\"sequence_key\"")) {
 			continue
 		}
 
 		metadata := map[string]json.RawMessage{}
 		_ = json.Unmarshal(job.Metadata, &metadata)
 
-		if ephemeral, ok := metadataBool(metadata, "ephemeral"); ok && ephemeral {
-			ephemeralIDs = append(ephemeralIDs, job.ID)
+		if job.State == rivertype.JobStateCompleted {
+			if ephemeral, ok := metadataBool(metadata, "ephemeral"); ok && ephemeral {
+				ephemeralIDs = append(ephemeralIDs, job.ID)
+			}
 		}
 
-		if workflowID, ok := metadataString(metadata, "workflow_id"); ok && workflowID != "" {
-			workflowIDs[workflowID] = struct{}{}
+		if isWorkflowFinalizedState(job.State) {
+			if workflowID, ok := metadataString(metadata, "workflow_id"); ok && workflowID != "" {
+				workflowIDs[workflowID] = struct{}{}
+			}
+			if sequenceKey, ok := metadataString(metadata, "sequence_key"); ok && sequenceKey != "" {
+				sequenceQueues[job.Queue] = struct{}{}
+			}
 		}
 	}
 
@@ -120,7 +136,7 @@ func (p *StandardPilot) JobSetStateIfRunningMany(ctx context.Context, exec river
 	}
 
 	for workflowID := range workflowIDs {
-		if err := promoteWorkflowPending(ctx, exec, params.Schema, workflowID); err != nil {
+		if err := PromoteWorkflowPending(ctx, exec, params.Schema, workflowID); err != nil {
 			if errors.Is(err, riverdriver.ErrNotImplemented) {
 				continue
 			}
@@ -128,7 +144,79 @@ func (p *StandardPilot) JobSetStateIfRunningMany(ctx context.Context, exec river
 		}
 	}
 
+	if err := promoteSequences(ctx, exec, params.Schema, sequenceQueues, p.notifyNonTxJobInsert); err != nil {
+		return nil, err
+	}
+
 	return jobs, nil
+}
+
+func appendAndPromoteSequences(ctx context.Context, exec riverdriver.Executor, schema string, results []*riverdriver.JobInsertFastResult, params []*riverdriver.JobInsertFastParams, notify func(context.Context, []*rivertype.JobInsertResult)) error {
+	sequenceAppendByQueue := make(map[string]struct {
+		jobIDs []int64
+		keys   []string
+	})
+	sequenceQueues := make(map[string]struct{})
+
+	for i, result := range results {
+		if result == nil || result.Job == nil || result.UniqueSkippedAsDuplicate || i >= len(params) {
+			continue
+		}
+		metadata := map[string]json.RawMessage{}
+		if err := json.Unmarshal(params[i].Metadata, &metadata); err != nil {
+			continue
+		}
+		sequenceKey, ok := metadataString(metadata, "sequence_key")
+		if !ok || sequenceKey == "" {
+			continue
+		}
+		queue := result.Job.Queue
+		item := sequenceAppendByQueue[queue]
+		item.jobIDs = append(item.jobIDs, result.Job.ID)
+		item.keys = append(item.keys, sequenceKey)
+		sequenceAppendByQueue[queue] = item
+		sequenceQueues[queue] = struct{}{}
+	}
+
+	for queue, item := range sequenceAppendByQueue {
+		if _, err := exec.SequenceAppendMany(ctx, &riverdriver.SequenceAppendManyParams{JobIDs: item.jobIDs, Keys: item.keys, Queue: queue, Schema: schema}); err != nil && !errors.Is(err, riverdriver.ErrNotImplemented) {
+			return err
+		}
+	}
+
+	return promoteSequences(ctx, exec, schema, sequenceQueues, notify)
+}
+
+func promoteSequences(ctx context.Context, exec riverdriver.Executor, schema string, queues map[string]struct{}, notify func(context.Context, []*rivertype.JobInsertResult)) error {
+	if len(queues) == 0 {
+		return nil
+	}
+	promotedQueues := make([]string, 0, len(queues))
+	for queue := range queues {
+		res, err := exec.SequencePromote(ctx, &riverdriver.SequencePromoteParams{Max: 1000, Queue: queue, Schema: schema})
+		if err != nil {
+			if errors.Is(err, riverdriver.ErrNotImplemented) {
+				continue
+			}
+			return err
+		}
+		promotedQueues = append(promotedQueues, res...)
+	}
+	if len(promotedQueues) == 0 {
+		return nil
+	}
+	if notify != nil {
+		fake := make([]*rivertype.JobInsertResult, 0, len(promotedQueues))
+		for _, queue := range promotedQueues {
+			fake = append(fake, &rivertype.JobInsertResult{Job: &rivertype.JobRow{Queue: queue}})
+		}
+		notify(ctx, fake)
+	}
+	payloads := make([]string, 0, len(promotedQueues))
+	for _, queue := range promotedQueues {
+		payloads = append(payloads, fmt.Sprintf("{\"queue\": %q}", queue))
+	}
+	return exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Payload: payloads, Schema: schema, Topic: string(notifier.NotificationTopicInsert)})
 }
 
 func metadataBool(m map[string]json.RawMessage, key string) (bool, bool) {
@@ -155,38 +243,100 @@ func metadataString(m map[string]json.RawMessage, key string) (string, bool) {
 	return val, true
 }
 
-func promoteWorkflowPending(ctx context.Context, exec riverdriver.Executor, schema, workflowID string) error {
+func isWorkflowFinalizedState(state rivertype.JobState) bool {
+	switch state {
+	case rivertype.JobStateCancelled, rivertype.JobStateCompleted, rivertype.JobStateDiscarded:
+		return true
+	default:
+		return false
+	}
+}
+
+func metadataBoolDefault(m map[string]json.RawMessage, key string) bool {
+	val, ok := metadataBool(m, key)
+	return ok && val
+}
+
+func PromoteWorkflowPending(ctx context.Context, exec riverdriver.Executor, schema, workflowID string) error {
 	rows, err := exec.WorkflowLoadJobsWithDeps(ctx, &riverdriver.WorkflowLoadJobsWithDepsParams{Schema: schema, WorkflowID: workflowID})
 	if err != nil {
 		return err
 	}
 
-	completed := make(map[string]struct{}, len(rows))
+	byTask := make(map[string]*riverdriver.WorkflowTaskWithJob, len(rows))
 	for _, row := range rows {
 		if row == nil || row.Task == nil || row.Job == nil {
 			continue
 		}
-		if row.Job.State == rivertype.JobStateCompleted {
-			completed[row.Task.TaskName] = struct{}{}
-		}
+		byTask[row.Task.TaskName] = row
 	}
 
 	stageIDs := make([]int64, 0)
+	cancelIDs := make([]int64, 0)
 	for _, row := range rows {
 		if row == nil || row.Task == nil || row.Job == nil || row.Job.State != rivertype.JobStatePending {
 			continue
 		}
 
+		metadata := map[string]json.RawMessage{}
+		if len(row.Job.Metadata) > 0 {
+			_ = json.Unmarshal(row.Job.Metadata, &metadata)
+		}
+
+		ignoreCancelledDeps := metadataBoolDefault(metadata, "workflow_ignore_cancelled_deps")
+		ignoreDiscardedDeps := metadataBoolDefault(metadata, "workflow_ignore_discarded_deps")
+		ignoreDeletedDeps := metadataBoolDefault(metadata, "workflow_ignore_deleted_deps")
+
 		depsSatisfied := true
+		shouldCancel := false
 		for _, dep := range row.Task.Deps {
-			if _, ok := completed[dep]; !ok {
+			depRow, ok := byTask[dep]
+			if !ok || depRow == nil || depRow.Job == nil {
+				if ignoreDeletedDeps {
+					continue
+				}
+				shouldCancel = true
 				depsSatisfied = false
+				break
+			}
+
+			switch depRow.Job.State {
+			case rivertype.JobStateCompleted:
+				continue
+			case rivertype.JobStateCancelled:
+				if ignoreCancelledDeps {
+					continue
+				}
+				shouldCancel = true
+				depsSatisfied = false
+			case rivertype.JobStateDiscarded:
+				if ignoreDiscardedDeps {
+					continue
+				}
+				shouldCancel = true
+				depsSatisfied = false
+			default:
+				depsSatisfied = false
+			}
+
+			if shouldCancel || !depsSatisfied {
 				break
 			}
 		}
 
+		if shouldCancel {
+			cancelIDs = append(cancelIDs, row.Job.ID)
+			continue
+		}
+
 		if depsSatisfied {
 			stageIDs = append(stageIDs, row.Job.ID)
+		}
+	}
+
+	if len(cancelIDs) > 0 {
+		if _, err := exec.WorkflowCancelWithFailedDepsMany(ctx, &riverdriver.WorkflowCancelWithFailedDepsManyParams{JobID: cancelIDs, Schema: schema}); err != nil {
+			return err
 		}
 	}
 
@@ -205,11 +355,16 @@ func (p *StandardPilot) PeriodicJobKeepAliveAndReap(ctx context.Context, exec ri
 
 	now := time.Now().UTC()
 
+	staleThreshold := params.StaleThreshold
+	if staleThreshold == 0 {
+		staleThreshold = 24 * time.Hour
+	}
+
 	// Reap stale periodic jobs first.
 	reaped, err := exec.PeriodicJobKeepAliveAndReap(ctx, &riverdriver.PeriodicJobKeepAliveAndReapParams{
 		Now:                   &now,
 		Schema:                params.Schema,
-		StaleUpdatedAtHorizon: now.Add(-24 * time.Hour),
+		StaleUpdatedAtHorizon: now.Add(-staleThreshold),
 	})
 	if errors.Is(err, riverdriver.ErrNotImplemented) {
 		return nil, nil
@@ -293,6 +448,7 @@ func (p *StandardPilot) PeriodicJobUpsertMany(ctx context.Context, exec riverdri
 
 func (p *StandardPilot) PilotInit(archetype *baseservice.Archetype, params *PilotInitParams) {
 	p.durablePeriodicJobsEnabled.Store(params.DurablePeriodicJobsEnabled)
+	p.notifyNonTxJobInsert = params.NotifyNonTxJobInsert
 }
 
 func (p *StandardPilot) ProducerInit(ctx context.Context, exec riverdriver.Executor, params *ProducerInitParams) (int64, ProducerState, error) {

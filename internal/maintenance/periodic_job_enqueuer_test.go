@@ -979,6 +979,92 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		}, insertedPeriodicJobIDs)
 	})
 
+	t.Run("DurableNextRunAtRatchetFunc", func(t *testing.T) {
+		t.Parallel()
+
+		svc, bundle := setup(t)
+		svc.Config.DurableConfig = &PeriodicJobEnqueuerDurableConfig{
+			NextRunAtRatchetFunc: func(nextRunAt, now time.Time) time.Time {
+				if nextRunAt.Before(now) {
+					return now
+				}
+				return nextRunAt
+			},
+			StaleThreshold:        24 * time.Hour,
+			StartStaggerSpread:    time.Minute,
+			StartStaggerThreshold: -1,
+		}
+
+		_, err := svc.AddManySafely([]*PeriodicJob{{ID: "periodic_job_10s", ScheduleFunc: periodicIntervalSchedule(10 * time.Second), ConstructorFunc: jobConstructorFunc("periodic_job_10s", false)}})
+		require.NoError(t, err)
+
+		now := time.Now().UTC()
+		bundle.pilotMock.PeriodicJobGetAllMock = func(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobGetAllParams) ([]*riverpilot.PeriodicJob, error) {
+			return []*riverpilot.PeriodicJob{{ID: "periodic_job_10s", NextRunAt: now.Add(-time.Hour)}}, nil
+		}
+
+		startService(t, svc)
+		svc.TestSignals.InsertedJobs.WaitOrTimeout()
+
+		periodicJob := svc.periodicJobs[svc.periodicJobIDs["periodic_job_10s"]]
+		require.WithinDuration(t, now.Add(10*time.Second), periodicJob.nextRunAt, time.Second)
+	})
+
+	t.Run("DurableStaleThreshold", func(t *testing.T) {
+		t.Parallel()
+
+		svc, bundle := setup(t)
+		svc.Config.DurableConfig = &PeriodicJobEnqueuerDurableConfig{StaleThreshold: 2 * time.Hour}
+
+		_, err := svc.AddManySafely([]*PeriodicJob{{ID: "periodic_job_100ms", ScheduleFunc: periodicIntervalSchedule(100 * time.Millisecond), ConstructorFunc: jobConstructorFunc("periodic_job_100ms", false)}})
+		require.NoError(t, err)
+
+		var gotThreshold time.Duration
+		bundle.pilotMock.PeriodicJobKeepAliveAndReapMock = func(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobKeepAliveAndReapParams) ([]*riverpilot.PeriodicJob, error) {
+			gotThreshold = params.StaleThreshold
+			return nil, nil
+		}
+
+		startService(t, svc)
+		svc.TestSignals.PeriodicJobKeepAliveAndReap.WaitOrTimeout()
+		require.Equal(t, 2*time.Hour, gotThreshold)
+	})
+
+	t.Run("DurableStartStagger", func(t *testing.T) {
+		t.Parallel()
+
+		svc, bundle := setup(t)
+		now := svc.Time.StubNowUTC(time.Now().UTC())
+		svc.Config.DurableConfig = &PeriodicJobEnqueuerDurableConfig{
+			NextRunAtRatchetFunc:  func(nextRunAt, _ time.Time) time.Time { return nextRunAt },
+			StaleThreshold:        24 * time.Hour,
+			StartStaggerSpread:    time.Minute,
+			StartStaggerThreshold: 2,
+		}
+
+		_, err := svc.AddManySafely([]*PeriodicJob{
+			{ID: "periodic_job_10s", ScheduleFunc: periodicIntervalSchedule(10 * time.Second), ConstructorFunc: jobConstructorFunc("periodic_job_10s", false)},
+			{ID: "periodic_job_20s", ScheduleFunc: periodicIntervalSchedule(20 * time.Second), ConstructorFunc: jobConstructorFunc("periodic_job_20s", false)},
+		})
+		require.NoError(t, err)
+
+		bundle.pilotMock.PeriodicJobGetAllMock = func(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobGetAllParams) ([]*riverpilot.PeriodicJob, error) {
+			return []*riverpilot.PeriodicJob{
+				{ID: "periodic_job_10s", NextRunAt: now.Add(-time.Second)},
+				{ID: "periodic_job_20s", NextRunAt: now.Add(-2 * time.Second)},
+			}, nil
+		}
+
+		startService(t, svc)
+		svc.TestSignals.EnteredLoop.WaitOrTimeout()
+
+		for _, id := range []string{"periodic_job_10s", "periodic_job_20s"} {
+			periodicJob := svc.periodicJobs[svc.periodicJobIDs[id]]
+			require.True(t, periodicJob.nextRunAt.After(now))
+			require.True(t, !periodicJob.nextRunAt.After(now.Add(time.Minute+time.Second)))
+		}
+	})
+
 	t.Run("DuplicateIDError", func(t *testing.T) {
 		t.Parallel()
 

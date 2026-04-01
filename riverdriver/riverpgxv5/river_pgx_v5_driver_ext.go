@@ -213,17 +213,6 @@ func (e *Executor) JobGetAvailableForBatch(ctx context.Context, params *riverdri
 }
 
 func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *riverdriver.JobGetAvailableLimitedParams) ([]*rivertype.JobRow, error) {
-	if len(params.PartitionByArgs) > 0 {
-		return e.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-			ClientID:       params.ClientID,
-			MaxAttemptedBy: params.MaxAttemptedBy,
-			MaxToLock:      params.MaxToLock,
-			Now:            params.Now,
-			Queue:          params.Queue,
-			Schema:         params.Schema,
-		})
-	}
-
 	globalLimit := int(params.GlobalLimit)
 	localLimit := int(params.LocalLimit)
 	if globalLimit <= 0 {
@@ -244,15 +233,17 @@ func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *riverdriv
 		})
 	}
 
-	idsTyped, err := dbsqlc.New().JobGetAvailableLimitedByKind(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetAvailableLimitedByKindParams{
-		Queue:           params.Queue,
-		Now:             params.Now,
-		GlobalLimit:     int32(globalLimit),
-		LocalLimit:      int32(localLimit),
-		MaxToLock:       int32(params.MaxToLock),
-		MaxAttemptedBy:  int32(params.MaxAttemptedBy),
-		AttemptedBy:     params.ClientID,
-		PartitionByKind: params.PartitionByKind,
+	idsTyped, err := dbsqlc.New().JobGetAvailableLimited(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetAvailableLimitedParams{
+		Queue:                  params.Queue,
+		Now:                    params.Now,
+		GlobalLimit:            int32(globalLimit),
+		LocalLimit:             int32(localLimit),
+		MaxToLock:              int32(params.MaxToLock),
+		MaxAttemptedBy:         int32(params.MaxAttemptedBy),
+		AttemptedBy:            params.ClientID,
+		AvailablePartitionKeys: params.AvailablePartitionKeys,
+		PartitionByArgs:        params.PartitionByArgs,
+		PartitionByKind:        params.PartitionByKind,
 	})
 	if err != nil {
 		return nil, interpretError(err)
@@ -270,11 +261,20 @@ func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *riverdriv
 }
 
 func (e *Executor) JobGetAvailablePartitionKeys(ctx context.Context, params *riverdriver.JobGetAvailablePartitionKeysParams) ([]string, error) {
-	keys, err := dbsqlc.New().JobGetAvailablePartitionKeys(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Queue)
+	keys, err := dbsqlc.New().JobGetAvailablePartitionKeys(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetAvailablePartitionKeysParams{
+		Queue:           params.Queue,
+		Now:             nil,
+		PartitionByArgs: params.PartitionByArgs,
+		PartitionByKind: params.PartitionByKind,
+	})
 	if err != nil {
 		return nil, interpretError(err)
 	}
-	return keys, nil
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, anyToString(key))
+	}
+	return out, nil
 }
 
 func (e *Executor) PGTryAdvisoryXactLock(ctx context.Context, key int64) (bool, error) {
@@ -489,7 +489,14 @@ func (e *Executor) WorkflowCancelWithFailedDepsMany(ctx context.Context, params 
 	if len(params.JobID) == 0 {
 		return nil, nil
 	}
-	ids, err := dbsqlc.New().WorkflowCancelByIDs(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.JobID)
+	failedAt := params.WorkflowDepsFailedAt
+	if failedAt.IsZero() {
+		failedAt = time.Now().UTC()
+	}
+	ids, err := dbsqlc.New().WorkflowCancelWithFailedDepsByIDs(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.WorkflowCancelWithFailedDepsByIDsParams{
+		WorkflowDepsFailedAt: &failedAt,
+		IDs:                  params.JobID,
+	})
 	if err != nil {
 		return nil, interpretError(err)
 	}
@@ -700,11 +707,109 @@ func (e *Executor) WorkflowLoadTasksByNames(ctx context.Context, params *riverdr
 }
 
 func (e *Executor) WorkflowRetry(ctx context.Context, params *riverdriver.WorkflowRetryParams) ([]*rivertype.JobRow, error) {
-	ids, err := dbsqlc.New().WorkflowRetry(schemaTemplateParam(ctx, params.Schema), e.dbtx, pgtype.Text{String: params.WorkflowID, Valid: params.WorkflowID != ""})
+	rows, err := e.WorkflowLoadJobsWithDeps(ctx, &riverdriver.WorkflowLoadJobsWithDepsParams{Schema: params.Schema, WorkflowID: params.WorkflowID})
+	if err != nil {
+		return nil, err
+	}
+
+	selectedByTask := workflowRetrySelection(rows, params.Mode)
+	if len(selectedByTask) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]int64, 0, len(selectedByTask))
+	pendingIDs := make([]int64, 0, len(selectedByTask))
+	for _, row := range selectedByTask {
+		ids = append(ids, row.Job.ID)
+		for _, dep := range row.Task.Deps {
+			if _, ok := selectedByTask[dep]; ok {
+				pendingIDs = append(pendingIDs, row.Job.ID)
+				break
+			}
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	sort.Slice(pendingIDs, func(i, j int) bool { return pendingIDs[i] < pendingIDs[j] })
+
+	returnedIDs, err := dbsqlc.New().WorkflowRetryByIDMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.WorkflowRetryByIDManyParams{
+		IDs:          ids,
+		ResetHistory: params.ResetHistory,
+		Now:          &params.Now,
+	})
 	if err != nil {
 		return nil, interpretError(err)
 	}
-	return e.fetchJobsByIDMany(ctx, params.Schema, ids)
+	if len(pendingIDs) > 0 {
+		if _, err := dbsqlc.New().WorkflowSetPendingByIDMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, pendingIDs); err != nil {
+			return nil, interpretError(err)
+		}
+	}
+	return e.fetchJobsByIDMany(ctx, params.Schema, returnedIDs)
+}
+
+func workflowRetrySelection(rows []*riverdriver.WorkflowTaskWithJob, mode string) map[string]*riverdriver.WorkflowTaskWithJob {
+	byTask := make(map[string]*riverdriver.WorkflowTaskWithJob, len(rows))
+	downstream := make(map[string][]string, len(rows))
+	failed := make([]string, 0)
+	for _, row := range rows {
+		if row == nil || row.Task == nil || row.Job == nil || row.Task.TaskName == "" {
+			continue
+		}
+		byTask[row.Task.TaskName] = row
+		for _, dep := range row.Task.Deps {
+			downstream[dep] = append(downstream[dep], row.Task.TaskName)
+		}
+		if row.Job.State == rivertype.JobStateDiscarded || (row.Job.State == rivertype.JobStateCancelled && workflowDepsFailed(row.Job.Metadata)) {
+			failed = append(failed, row.Task.TaskName)
+		}
+	}
+
+	selected := make(map[string]*riverdriver.WorkflowTaskWithJob, len(rows))
+	switch mode {
+	case "", "all":
+		for taskName, row := range byTask {
+			if row.Job.State == rivertype.JobStateCancelled || row.Job.State == rivertype.JobStateCompleted || row.Job.State == rivertype.JobStateDiscarded {
+				selected[taskName] = row
+			}
+		}
+	case "failed_only":
+		for _, taskName := range failed {
+			selected[taskName] = byTask[taskName]
+		}
+	case "failed_and_downstream":
+		queue := append([]string(nil), failed...)
+		for len(queue) > 0 {
+			taskName := queue[0]
+			queue = queue[1:]
+			if _, ok := selected[taskName]; ok {
+				continue
+			}
+			row := byTask[taskName]
+			if row == nil {
+				continue
+			}
+			selected[taskName] = row
+			queue = append(queue, downstream[taskName]...)
+		}
+	default:
+		for _, taskName := range failed {
+			selected[taskName] = byTask[taskName]
+		}
+	}
+
+	return selected
+}
+
+func workflowDepsFailed(metadataBytes []byte) bool {
+	if len(metadataBytes) == 0 {
+		return false
+	}
+	metadata := map[string]json.RawMessage{}
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		return false
+	}
+	_, ok := metadata["workflow_deps_failed_at"]
+	return ok
 }
 
 func (e *Executor) WorkflowRetryLockAndCheckRunning(ctx context.Context, params *riverdriver.WorkflowRetryLockAndCheckRunningParams) (*riverdriver.WorkflowRetryLockAndCheckRunningResult, error) {
@@ -714,13 +819,26 @@ func (e *Executor) WorkflowRetryLockAndCheckRunning(ctx context.Context, params 
 		return nil, err
 	}
 	if !locked {
-		return &riverdriver.WorkflowRetryLockAndCheckRunningResult{CanRetry: false}, nil
+		return &riverdriver.WorkflowRetryLockAndCheckRunningResult{CanRetry: false, WorkflowIsActive: true}, nil
 	}
-	running, err := dbsqlc.New().WorkflowCountRunning(schemaTemplateParam(ctx, params.Schema), e.dbtx, pgtype.Text{String: params.WorkflowID, Valid: params.WorkflowID != ""})
+	jobs, err := e.WorkflowJobList(ctx, &riverdriver.WorkflowJobListParams{Schema: params.Schema, WorkflowID: params.WorkflowID})
 	if err != nil {
-		return nil, interpretError(err)
+		return nil, err
 	}
-	return &riverdriver.WorkflowRetryLockAndCheckRunningResult{CanRetry: running == 0}, nil
+	workflowIsActive := false
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		switch job.State {
+		case rivertype.JobStateAvailable, rivertype.JobStatePending, rivertype.JobStateRetryable, rivertype.JobStateRunning, rivertype.JobStateScheduled:
+			workflowIsActive = true
+		}
+		if workflowIsActive {
+			break
+		}
+	}
+	return &riverdriver.WorkflowRetryLockAndCheckRunningResult{CanRetry: !workflowIsActive, WorkflowIsActive: workflowIsActive}, nil
 }
 
 func advisoryLockKeyFromString(s string) int64 {

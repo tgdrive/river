@@ -113,22 +113,31 @@ type WorkflowLoadDepsOpts struct {
 	Recursive bool
 }
 
-type WorkflowRetryOpts struct{}
+type WorkflowRetryOpts struct {
+	Mode         WorkflowRetryMode
+	ResetHistory bool
+}
 
-type WorkflowRetryMode int
+type WorkflowRetryMode string
 
 const (
-	WorkflowRetryModeDefault WorkflowRetryMode = iota
+	WorkflowRetryModeAll                 WorkflowRetryMode = "all"
+	WorkflowRetryModeFailedOnly          WorkflowRetryMode = "failed_only"
+	WorkflowRetryModeFailedAndDownstream WorkflowRetryMode = "failed_and_downstream"
 )
 
 type WorkflowRetryResult struct {
+	Jobs        []*rivertype.JobRow
 	RetriedJobs []*rivertype.JobRow
 }
 
-type WorkflowRetryStillActiveError struct{}
+type WorkflowRetryStillActiveError struct{ WorkflowID string }
 
 func (e *WorkflowRetryStillActiveError) Error() string {
-	return "workflow still has running jobs and cannot be retried"
+	if e.WorkflowID == "" {
+		return "workflow still has active jobs and cannot be retried"
+	}
+	return fmt.Sprintf("workflow %q still has active jobs and cannot be retried", e.WorkflowID)
 }
 
 func (e *WorkflowRetryStillActiveError) Is(target error) bool {
@@ -204,21 +213,33 @@ func (c *Client[TTx]) WorkflowFromExisting(job *rivertype.JobRow, opts *Workflow
 		workflowOpts = &WorkflowOpts{}
 	}
 
-	if workflowOpts.ID == "" {
-		if job == nil {
-			return nil, errors.New("workflow ID is required when creating workflow from existing job")
-		}
-		var metadata map[string]json.RawMessage
+	if job == nil {
+		return nil, errors.New("job cannot be nil")
+	}
+
+	metadata := map[string]json.RawMessage{}
+	if len(job.Metadata) > 0 {
 		if err := json.Unmarshal(job.Metadata, &metadata); err != nil {
 			return nil, err
 		}
+	}
+
+	if workflowOpts.ID == "" {
 		if workflowID, ok := metadata["workflow_id"]; ok {
 			if err := json.Unmarshal(workflowID, &workflowOpts.ID); err != nil {
 				return nil, err
 			}
 		}
 		if workflowOpts.ID == "" {
-			return nil, errors.New("workflow ID is required when creating workflow from existing job")
+			return nil, errors.New("job is not part of a workflow")
+		}
+	}
+
+	if workflowOpts.Name == "" {
+		if workflowName, ok := metadata["workflow_name"]; ok {
+			if err := json.Unmarshal(workflowName, &workflowOpts.Name); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -245,7 +266,7 @@ func (c *Client[TTx]) WorkflowPrepareTx(ctx context.Context, tx TTx, workflow *W
 	return workflow.PrepareTx(ctx, tx)
 }
 
-func (c *Client[TTx]) WorkflowRetryTx(ctx context.Context, tx TTx, workflowID string, _ *WorkflowRetryOpts) (*WorkflowRetryResult, error) {
+func (c *Client[TTx]) WorkflowRetryTx(ctx context.Context, tx TTx, workflowID string, opts *WorkflowRetryOpts) (*WorkflowRetryResult, error) {
 	exec := c.driver.UnwrapExecutor(tx)
 	canRetry, err := exec.WorkflowRetryLockAndCheckRunning(ctx, &riverdriver.WorkflowRetryLockAndCheckRunningParams{Schema: c.config.Schema, WorkflowID: workflowID})
 	if errors.Is(err, riverdriver.ErrNotImplemented) {
@@ -255,14 +276,29 @@ func (c *Client[TTx]) WorkflowRetryTx(ctx context.Context, tx TTx, workflowID st
 		return nil, err
 	}
 	if !canRetry.CanRetry {
-		return nil, &WorkflowRetryStillActiveError{}
+		return nil, &WorkflowRetryStillActiveError{WorkflowID: workflowID}
 	}
 
-	jobs, err := exec.WorkflowRetry(ctx, &riverdriver.WorkflowRetryParams{Schema: c.config.Schema, WorkflowID: workflowID})
+	mode := WorkflowRetryModeAll
+	resetHistory := false
+	if opts != nil {
+		if opts.Mode != "" {
+			mode = opts.Mode
+		}
+		resetHistory = opts.ResetHistory
+	}
+
+	jobs, err := exec.WorkflowRetry(ctx, &riverdriver.WorkflowRetryParams{
+		Mode:         string(mode),
+		Now:          c.baseService.Time.NowUTC(),
+		ResetHistory: resetHistory,
+		Schema:       c.config.Schema,
+		WorkflowID:   workflowID,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &WorkflowRetryResult{RetriedJobs: jobs}, nil
+	return &WorkflowRetryResult{Jobs: jobs, RetriedJobs: jobs}, nil
 }
 
 func (c *Client[TTx]) WorkflowCancel(ctx context.Context, workflowID string) (*WorkflowCancelResult, error) {
@@ -351,9 +387,41 @@ func (w *WorkflowT[TTx]) Prepare(_ context.Context) (*WorkflowPrepareResult, err
 		if len(insertOpts.Metadata) > 0 {
 			_ = json.Unmarshal(insertOpts.Metadata, &metadataMap)
 		}
+		if len(w.opts.Metadata) > 0 {
+			workflowMetadata := map[string]any{}
+			if err := json.Unmarshal(w.opts.Metadata, &workflowMetadata); err == nil {
+				for k, v := range workflowMetadata {
+					metadataMap[k] = v
+				}
+			}
+		}
+
+		ignoreCancelledDeps := w.opts.IgnoreCancelledDeps
+		ignoreDiscardedDeps := w.opts.IgnoreDiscardedDeps
+		ignoreDeletedDeps := w.opts.IgnoreDeletedDeps
+		if task.Opts != nil {
+			ignoreCancelledDeps = ignoreCancelledDeps || task.Opts.IgnoreCancelledDeps
+			ignoreDiscardedDeps = ignoreDiscardedDeps || task.Opts.IgnoreDiscardedDeps
+			ignoreDeletedDeps = ignoreDeletedDeps || task.Opts.IgnoreDeletedDeps
+		}
+
 		metadataMap["workflow_id"] = w.opts.ID
+		if w.opts.Name != "" {
+			metadataMap["workflow_name"] = w.opts.Name
+		}
 		metadataMap["workflow_task_name"] = task.Name
 		metadataMap["workflow_deps"] = deps
+		metadataMap["workflow_ignore_cancelled_deps"] = ignoreCancelledDeps
+		metadataMap["workflow_ignore_discarded_deps"] = ignoreDiscardedDeps
+		metadataMap["workflow_ignore_deleted_deps"] = ignoreDeletedDeps
+		if task.Opts != nil && len(task.Opts.Metadata) > 0 {
+			taskMetadata := map[string]any{}
+			if err := json.Unmarshal(task.Opts.Metadata, &taskMetadata); err == nil {
+				for k, v := range taskMetadata {
+					metadataMap[k] = v
+				}
+			}
+		}
 
 		metadataBytes, err := json.Marshal(metadataMap)
 		if err != nil {
@@ -404,6 +472,30 @@ func (w *WorkflowT[TTx]) loadAllWithExecutor(ctx context.Context, exec riverdriv
 	}
 
 	return out, nil
+}
+
+func (w *WorkflowT[TTx]) LoadTask(ctx context.Context, taskName string) (*WorkflowTaskWithJob, error) {
+	tasks, err := w.LoadDeps(ctx, taskName, nil)
+	if err != nil {
+		return nil, err
+	}
+	task := tasks.Get(taskName)
+	if task == nil {
+		return nil, rivertype.ErrNotFound
+	}
+	return task, nil
+}
+
+func (w *WorkflowT[TTx]) LoadTaskTx(ctx context.Context, tx TTx, taskName string) (*WorkflowTaskWithJob, error) {
+	tasks, err := w.LoadDepsTx(ctx, tx, taskName, nil)
+	if err != nil {
+		return nil, err
+	}
+	task := tasks.Get(taskName)
+	if task == nil {
+		return nil, rivertype.ErrNotFound
+	}
+	return task, nil
 }
 
 func (w *WorkflowT[TTx]) LoadDeps(ctx context.Context, taskName string, opts *WorkflowLoadDepsOpts) (*WorkflowTasks, error) {
@@ -584,15 +676,15 @@ func (w *WorkflowT[TTx]) LoadDepsByJobTx(ctx context.Context, tx TTx, job *river
 	return w.LoadDepsTx(ctx, tx, taskName, opts)
 }
 
-func (w *WorkflowT[TTx]) Retry(ctx context.Context, _ *WorkflowRetryOpts) (*WorkflowRetryResult, error) {
-	return w.retryWithExecutor(ctx, w.client.driver.GetExecutor())
+func (w *WorkflowT[TTx]) Retry(ctx context.Context, opts *WorkflowRetryOpts) (*WorkflowRetryResult, error) {
+	return w.retryWithExecutor(ctx, w.client.driver.GetExecutor(), opts)
 }
 
-func (w *WorkflowT[TTx]) RetryTx(ctx context.Context, tx TTx, _ *WorkflowRetryOpts) (*WorkflowRetryResult, error) {
-	return w.retryWithExecutor(ctx, w.client.driver.UnwrapExecutor(tx))
+func (w *WorkflowT[TTx]) RetryTx(ctx context.Context, tx TTx, opts *WorkflowRetryOpts) (*WorkflowRetryResult, error) {
+	return w.retryWithExecutor(ctx, w.client.driver.UnwrapExecutor(tx), opts)
 }
 
-func (w *WorkflowT[TTx]) retryWithExecutor(ctx context.Context, exec riverdriver.Executor) (*WorkflowRetryResult, error) {
+func (w *WorkflowT[TTx]) retryWithExecutor(ctx context.Context, exec riverdriver.Executor, opts *WorkflowRetryOpts) (*WorkflowRetryResult, error) {
 	canRetry, err := exec.WorkflowRetryLockAndCheckRunning(ctx, &riverdriver.WorkflowRetryLockAndCheckRunningParams{Schema: w.client.config.Schema, WorkflowID: w.ID()})
 	if errors.Is(err, riverdriver.ErrNotImplemented) {
 		return nil, errWorkflowNotImplemented
@@ -601,14 +693,22 @@ func (w *WorkflowT[TTx]) retryWithExecutor(ctx context.Context, exec riverdriver
 		return nil, err
 	}
 	if !canRetry.CanRetry {
-		return nil, &WorkflowRetryStillActiveError{}
+		return nil, &WorkflowRetryStillActiveError{WorkflowID: w.ID()}
 	}
 
-	jobs, err := exec.WorkflowRetry(ctx, &riverdriver.WorkflowRetryParams{Schema: w.client.config.Schema, WorkflowID: w.ID()})
+	mode := WorkflowRetryModeAll
+	resetHistory := false
+	if opts != nil {
+		if opts.Mode != "" {
+			mode = opts.Mode
+		}
+		resetHistory = opts.ResetHistory
+	}
+	jobs, err := exec.WorkflowRetry(ctx, &riverdriver.WorkflowRetryParams{Mode: string(mode), Now: w.client.baseService.Time.NowUTC(), ResetHistory: resetHistory, Schema: w.client.config.Schema, WorkflowID: w.ID()})
 	if err != nil {
 		return nil, err
 	}
-	return &WorkflowRetryResult{RetriedJobs: jobs}, nil
+	return &WorkflowRetryResult{Jobs: jobs, RetriedJobs: jobs}, nil
 }
 
 func workflowTaskNameFromJob(job *rivertype.JobRow) (string, error) {

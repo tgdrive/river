@@ -168,7 +168,7 @@ func (q *Queries) JobGetAvailableForBatch(ctx context.Context, db DBTX, arg *Job
 	return items, nil
 }
 
-const jobGetAvailableLimitedByKind = `-- name: JobGetAvailableLimitedByKind :many
+const jobGetAvailableLimited = `-- name: JobGetAvailableLimited :many
 SELECT river_job_get_available_limited_ids
 FROM /* TEMPLATE: schema */river_job_get_available_limited_ids(
     $1,
@@ -178,23 +178,27 @@ FROM /* TEMPLATE: schema */river_job_get_available_limited_ids(
     $5,
     $6,
     $7,
-    $8
+    $8::text[],
+    $9::text[],
+    $10
 )
 `
 
-type JobGetAvailableLimitedByKindParams struct {
-	Queue           string
-	Now             *time.Time
-	GlobalLimit     int32
-	LocalLimit      int32
-	MaxToLock       int32
-	MaxAttemptedBy  int32
-	AttemptedBy     string
-	PartitionByKind bool
+type JobGetAvailableLimitedParams struct {
+	Queue                  string
+	Now                    *time.Time
+	GlobalLimit            int32
+	LocalLimit             int32
+	MaxToLock              int32
+	MaxAttemptedBy         int32
+	AttemptedBy            string
+	AvailablePartitionKeys []string
+	PartitionByArgs        []string
+	PartitionByKind        bool
 }
 
-func (q *Queries) JobGetAvailableLimitedByKind(ctx context.Context, db DBTX, arg *JobGetAvailableLimitedByKindParams) ([]pgtype.Int8, error) {
-	rows, err := db.Query(ctx, jobGetAvailableLimitedByKind,
+func (q *Queries) JobGetAvailableLimited(ctx context.Context, db DBTX, arg *JobGetAvailableLimitedParams) ([]pgtype.Int8, error) {
+	rows, err := db.Query(ctx, jobGetAvailableLimited,
 		arg.Queue,
 		arg.Now,
 		arg.GlobalLimit,
@@ -202,6 +206,8 @@ func (q *Queries) JobGetAvailableLimitedByKind(ctx context.Context, db DBTX, arg
 		arg.MaxToLock,
 		arg.MaxAttemptedBy,
 		arg.AttemptedBy,
+		arg.AvailablePartitionKeys,
+		arg.PartitionByArgs,
 		arg.PartitionByKind,
 	)
 	if err != nil {
@@ -223,26 +229,50 @@ func (q *Queries) JobGetAvailableLimitedByKind(ctx context.Context, db DBTX, arg
 }
 
 const jobGetAvailablePartitionKeys = `-- name: JobGetAvailablePartitionKeys :many
-SELECT DISTINCT coalesce(sequence_key, metadata->>'sequence_key', '')
+SELECT DISTINCT concat(
+    CASE WHEN $1::boolean THEN kind ELSE '' END,
+    '|',
+    CASE
+        WHEN $2::text[] IS NULL THEN ''
+        WHEN cardinality($2::text[]) = 0 THEN args::jsonb::text
+        ELSE coalesce((
+            SELECT jsonb_object_agg(key, args->key ORDER BY key)
+            FROM unnest($2::text[]) AS key
+            WHERE args ? key
+        ), '{}'::jsonb)::text
+    END
+)
 FROM /* TEMPLATE: schema */river_job
-WHERE queue = $1
+WHERE queue = $3
   AND state = 'available'
-  AND coalesce(sequence_key, metadata->>'sequence_key') IS NOT NULL
+  AND scheduled_at <= coalesce($4::timestamptz, now())
 `
 
-func (q *Queries) JobGetAvailablePartitionKeys(ctx context.Context, db DBTX, queue string) ([]string, error) {
-	rows, err := db.Query(ctx, jobGetAvailablePartitionKeys, queue)
+type JobGetAvailablePartitionKeysParams struct {
+	PartitionByKind bool
+	PartitionByArgs []string
+	Queue           string
+	Now             *time.Time
+}
+
+func (q *Queries) JobGetAvailablePartitionKeys(ctx context.Context, db DBTX, arg *JobGetAvailablePartitionKeysParams) ([]interface{}, error) {
+	rows, err := db.Query(ctx, jobGetAvailablePartitionKeys,
+		arg.PartitionByKind,
+		arg.PartitionByArgs,
+		arg.Queue,
+		arg.Now,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []string
+	var items []interface{}
 	for rows.Next() {
-		var sequence_key string
-		if err := rows.Scan(&sequence_key); err != nil {
+		var concat interface{}
+		if err := rows.Scan(&concat); err != nil {
 			return nil, err
 		}
-		items = append(items, sequence_key)
+		items = append(items, concat)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -792,18 +822,40 @@ func (q *Queries) SequenceListExt(ctx context.Context, db DBTX, arg *SequenceLis
 }
 
 const sequencePromote = `-- name: SequencePromote :many
+WITH promotable AS (
+    SELECT j.id, j.queue
+    FROM /* TEMPLATE: schema */river_job j
+    WHERE j.queue = $1
+      AND j.state = 'pending'
+      AND coalesce(j.sequence_key, j.metadata->>'sequence_key') IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM /* TEMPLATE: schema */river_job prev
+        WHERE prev.queue = j.queue
+          AND coalesce(prev.sequence_key, prev.metadata->>'sequence_key') = coalesce(j.sequence_key, j.metadata->>'sequence_key')
+          AND prev.id < j.id
+          AND (
+            prev.state IN ('available', 'pending', 'retryable', 'running', 'scheduled')
+            OR (prev.state = 'cancelled' AND NOT coalesce((j.metadata->>'sequence_continue_on_cancelled')::boolean, false))
+            OR (prev.state = 'discarded' AND NOT coalesce((j.metadata->>'sequence_continue_on_discarded')::boolean, false))
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM /* TEMPLATE: schema */river_job same_seq_pending
+        WHERE same_seq_pending.queue = j.queue
+          AND same_seq_pending.state = 'pending'
+          AND coalesce(same_seq_pending.sequence_key, same_seq_pending.metadata->>'sequence_key') = coalesce(j.sequence_key, j.metadata->>'sequence_key')
+          AND same_seq_pending.id < j.id
+      )
+    ORDER BY j.id ASC
+    LIMIT $2
+)
 UPDATE /* TEMPLATE: schema */river_job j
 SET state = 'available',
     scheduled_at = now()
-WHERE j.id IN (
-    SELECT id
-    FROM /* TEMPLATE: schema */river_job rj
-    WHERE rj.queue = $1
-      AND rj.state = 'pending'
-      AND coalesce(rj.sequence_key, rj.metadata->>'sequence_key') IS NOT NULL
-    ORDER BY id ASC
-    LIMIT $2
-)
+FROM promotable
+WHERE j.id = promotable.id
 RETURNING j.queue
 `
 
@@ -899,6 +951,43 @@ RETURNING id
 
 func (q *Queries) WorkflowCancelByWorkflowID(ctx context.Context, db DBTX, workflowID pgtype.Text) ([]int64, error) {
 	rows, err := db.Query(ctx, workflowCancelByWorkflowID, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const workflowCancelWithFailedDepsByIDs = `-- name: WorkflowCancelWithFailedDepsByIDs :many
+UPDATE /* TEMPLATE: schema */river_job
+SET state = 'cancelled',
+    finalized_at = coalesce($1::timestamptz, now()),
+    metadata = metadata || jsonb_build_object(
+        'workflow_deps_failed_at', to_jsonb(coalesce($1::timestamptz, now()))
+    )
+WHERE id = any($2::bigint[])
+  AND state IN ('available', 'pending', 'retryable', 'scheduled')
+RETURNING id
+`
+
+type WorkflowCancelWithFailedDepsByIDsParams struct {
+	WorkflowDepsFailedAt *time.Time
+	IDs                  []int64
+}
+
+func (q *Queries) WorkflowCancelWithFailedDepsByIDs(ctx context.Context, db DBTX, arg *WorkflowCancelWithFailedDepsByIDsParams) ([]int64, error) {
+	rows, err := db.Query(ctx, workflowCancelWithFailedDepsByIDs, arg.WorkflowDepsFailedAt, arg.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -1250,18 +1339,57 @@ func (q *Queries) WorkflowLoadTasksByNames(ctx context.Context, db DBTX, arg *Wo
 	return items, nil
 }
 
-const workflowRetry = `-- name: WorkflowRetry :many
+const workflowRetryByIDMany = `-- name: WorkflowRetryByIDMany :many
 UPDATE /* TEMPLATE: schema */river_job
 SET state = 'available',
+    attempt = CASE WHEN $1::boolean THEN 0 ELSE attempt END,
+    attempted_at = CASE WHEN $1::boolean THEN NULL ELSE attempted_at END,
+    attempted_by = CASE WHEN $1::boolean THEN NULL ELSE attempted_by END,
+    errors = CASE WHEN $1::boolean THEN '{}'::jsonb[] ELSE errors END,
     finalized_at = NULL,
-    scheduled_at = now()
-WHERE coalesce(workflow_id, metadata->>'workflow_id') = $1
-  AND state IN ('cancelled','discarded')
+    max_attempts = CASE WHEN $1::boolean THEN max_attempts WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
+    metadata = CASE WHEN $1::boolean THEN metadata - 'output' ELSE metadata END,
+    scheduled_at = coalesce($2::timestamptz, now())
+WHERE id = any($3::bigint[])
 RETURNING id
 `
 
-func (q *Queries) WorkflowRetry(ctx context.Context, db DBTX, workflowID pgtype.Text) ([]int64, error) {
-	rows, err := db.Query(ctx, workflowRetry, workflowID)
+type WorkflowRetryByIDManyParams struct {
+	ResetHistory bool
+	Now          *time.Time
+	IDs          []int64
+}
+
+func (q *Queries) WorkflowRetryByIDMany(ctx context.Context, db DBTX, arg *WorkflowRetryByIDManyParams) ([]int64, error) {
+	rows, err := db.Query(ctx, workflowRetryByIDMany, arg.ResetHistory, arg.Now, arg.IDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const workflowSetPendingByIDMany = `-- name: WorkflowSetPendingByIDMany :many
+UPDATE /* TEMPLATE: schema */river_job
+SET state = 'pending'
+WHERE id = any($1::bigint[])
+  AND state = 'available'
+RETURNING id
+`
+
+func (q *Queries) WorkflowSetPendingByIDMany(ctx context.Context, db DBTX, ids []int64) ([]int64, error) {
+	rows, err := db.Query(ctx, workflowSetPendingByIDMany, ids)
 	if err != nil {
 		return nil, err
 	}

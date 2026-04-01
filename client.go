@@ -1,6 +1,7 @@
 package river
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -48,11 +49,12 @@ const (
 	FetchPollIntervalDefault = 1 * time.Second
 	FetchPollIntervalMin     = 1 * time.Millisecond
 
-	JobTimeoutDefault  = 1 * time.Minute
-	MaxAttemptsDefault = rivercommon.MaxAttemptsDefault
-	PriorityDefault    = rivercommon.PriorityDefault
-	QueueDefault       = rivercommon.QueueDefault
-	QueueNumWorkersMax = 10_000
+	JobTimeoutDefault           = 1 * time.Minute
+	MaxAttemptsDefault          = rivercommon.MaxAttemptsDefault
+	PartitionKeyCacheTTLDefault = 1 * time.Second
+	PriorityDefault             = rivercommon.PriorityDefault
+	QueueDefault                = rivercommon.QueueDefault
+	QueueNumWorkersMax          = 10_000
 )
 
 var postgresSchemaNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
@@ -431,7 +433,7 @@ func (c *Config) WithDefaults() *Config {
 		CompletedJobRetentionPeriod: cmp.Or(c.CompletedJobRetentionPeriod, riversharedmaintenance.CompletedJobRetentionPeriodDefault),
 		DeadLetterQueue:             c.DeadLetterQueue,
 		DiscardedJobRetentionPeriod: cmp.Or(c.DiscardedJobRetentionPeriod, riversharedmaintenance.DiscardedJobRetentionPeriodDefault),
-		DurablePeriodicJobs:         c.DurablePeriodicJobs,
+		DurablePeriodicJobs:         durablePeriodicJobsConfigWithDefaults(c.DurablePeriodicJobs),
 		ErrorHandler:                c.ErrorHandler,
 		FetchCooldown:               cmp.Or(c.FetchCooldown, FetchCooldownDefault),
 		FetchPollInterval:           cmp.Or(c.FetchPollInterval, FetchPollIntervalDefault),
@@ -442,7 +444,7 @@ func (c *Config) WithDefaults() *Config {
 		Logger:                      logger,
 		MaxAttempts:                 cmp.Or(c.MaxAttempts, MaxAttemptsDefault),
 		Middleware:                  c.Middleware,
-		PartitionKeyCacheTTL:        c.PartitionKeyCacheTTL,
+		PartitionKeyCacheTTL:        cmp.Or(c.PartitionKeyCacheTTL, PartitionKeyCacheTTLDefault),
 		PeriodicJobs:                c.PeriodicJobs,
 		PollOnly:                    c.PollOnly,
 		Queues:                      c.Queues,
@@ -483,8 +485,8 @@ func (c *Config) validate() error {
 	if c.FetchPollInterval < c.FetchCooldown {
 		return fmt.Errorf("FetchPollInterval cannot be shorter than FetchCooldown (%s)", c.FetchCooldown)
 	}
-	if c.PartitionKeyCacheTTL < 0 {
-		return errors.New("PartitionKeyCacheTTL cannot be less than zero")
+	if c.PartitionKeyCacheTTL < -1 {
+		return errors.New("PartitionKeyCacheTTL cannot be less than zero, except for -1 (disabled)")
 	}
 	if c.SequenceSchedulerInterval < 0 {
 		return errors.New("SequenceSchedulerInterval cannot be less than zero")
@@ -663,6 +665,10 @@ type DeadLetterConfig struct {
 type DurablePeriodicJobsConfig struct {
 	Enabled bool
 
+	// NextRunAtRatchetFunc optionally adjusts persisted next-run timestamps loaded
+	// from durable storage on startup.
+	NextRunAtRatchetFunc func(nextRunAt, now time.Time) time.Time
+
 	// StaleThreshold is the duration after which stale persisted periodic job
 	// records may be reaped.
 	StaleThreshold time.Duration
@@ -674,6 +680,28 @@ type DurablePeriodicJobsConfig struct {
 	// StartStaggerThreshold controls how many backlogged jobs must exist before
 	// startup staggering is applied.
 	StartStaggerThreshold int
+}
+
+const (
+	durablePeriodicJobsStaleThresholdDefault        = 24 * time.Hour
+	durablePeriodicJobsStartStaggerSpreadDefault    = time.Minute
+	durablePeriodicJobsStartStaggerThresholdDefault = 500
+)
+
+func durablePeriodicJobsConfigWithDefaults(config *DurablePeriodicJobsConfig) *DurablePeriodicJobsConfig {
+	if config == nil {
+		return nil
+	}
+	out := *config
+	if out.NextRunAtRatchetFunc == nil {
+		out.NextRunAtRatchetFunc = func(nextRunAt, _ time.Time) time.Time { return nextRunAt }
+	}
+	out.StaleThreshold = cmp.Or(out.StaleThreshold, durablePeriodicJobsStaleThresholdDefault)
+	out.StartStaggerSpread = cmp.Or(out.StartStaggerSpread, durablePeriodicJobsStartStaggerSpreadDefault)
+	if out.StartStaggerThreshold == 0 {
+		out.StartStaggerThreshold = durablePeriodicJobsStartStaggerThresholdDefault
+	}
+	return &out
 }
 
 // QueueEphemeralConfig configures ephemeral queue behavior.
@@ -694,6 +722,9 @@ func (c *ConcurrencyConfig) validate() error {
 	}
 	if c.LocalLimit < 0 {
 		return errors.New("Concurrency.LocalLimit cannot be less than zero")
+	}
+	if c.GlobalLimit == 0 && c.LocalLimit == 0 {
+		return errors.New("Concurrency must specify at least one of GlobalLimit or LocalLimit")
 	}
 	return nil
 }
@@ -1069,8 +1100,28 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		}
 
 		{
+			sequencePromoter := maintenance.NewSequencePromoter(archetype, &maintenance.SequencePromoterConfig{
+				Interval:             cmp.Or(config.SequenceSchedulerInterval, maintenance.JobSchedulerIntervalDefault),
+				NotifyNonTxJobInsert: client.notifyProducerWithoutListenerJobFetch,
+				Schema:               config.Schema,
+			}, driver.GetExecutor())
+			maintenanceServices = append(maintenanceServices, sequencePromoter)
+		}
+
+		{
+			var durableConfig *maintenance.PeriodicJobEnqueuerDurableConfig
+			if config.DurablePeriodicJobs != nil {
+				durableConfig = &maintenance.PeriodicJobEnqueuerDurableConfig{
+					NextRunAtRatchetFunc:  config.DurablePeriodicJobs.NextRunAtRatchetFunc,
+					StaleThreshold:        config.DurablePeriodicJobs.StaleThreshold,
+					StartStaggerSpread:    config.DurablePeriodicJobs.StartStaggerSpread,
+					StartStaggerThreshold: config.DurablePeriodicJobs.StartStaggerThreshold,
+				}
+			}
+
 			periodicJobEnqueuer, err := maintenance.NewPeriodicJobEnqueuer(archetype, &maintenance.PeriodicJobEnqueuerConfig{
 				AdvisoryLockPrefix: config.AdvisoryLockPrefix,
+				DurableConfig:      durableConfig,
 				HookLookupGlobal:   client.hookLookupGlobal,
 				Insert:             client.insertMany,
 				Pilot:              client.pilot,
@@ -1604,10 +1655,17 @@ func (c *Client[TTx]) jobCancel(ctx context.Context, exec riverdriver.Executor, 
 // deleted row if it was deleted. Jobs in the running state are not deleted,
 // instead returning rivertype.ErrJobRunning.
 func (c *Client[TTx]) JobDelete(ctx context.Context, id int64) (*rivertype.JobRow, error) {
-	return c.driver.GetExecutor().JobDelete(ctx, &riverdriver.JobDeleteParams{
+	job, err := c.driver.GetExecutor().JobDelete(ctx, &riverdriver.JobDeleteParams{
 		ID:     id,
 		Schema: c.config.Schema,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if err := c.promotePendingWorkflowsForJobs(ctx, c.driver.GetExecutor(), []*rivertype.JobRow{job}); err != nil {
+		return nil, err
+	}
+	return job, nil
 }
 
 // JobDeleteTx deletes the job with the given ID from the database, returning the
@@ -1617,10 +1675,48 @@ func (c *Client[TTx]) JobDelete(ctx context.Context, id int64) (*rivertype.JobRo
 // until the transaction commits, and if the transaction rolls back, so too is
 // the deleted job.
 func (c *Client[TTx]) JobDeleteTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
-	return c.driver.UnwrapExecutor(tx).JobDelete(ctx, &riverdriver.JobDeleteParams{
+	exec := c.driver.UnwrapExecutor(tx)
+	job, err := exec.JobDelete(ctx, &riverdriver.JobDeleteParams{
 		ID:     id,
 		Schema: c.config.Schema,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if err := c.promotePendingWorkflowsForJobs(ctx, exec, []*rivertype.JobRow{job}); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+func (c *Client[TTx]) promotePendingWorkflowsForJobs(ctx context.Context, exec riverdriver.Executor, jobs []*rivertype.JobRow) error {
+	workflowIDs := make(map[string]struct{})
+	for _, job := range jobs {
+		if job == nil || len(job.Metadata) == 0 {
+			continue
+		}
+		metadata := map[string]json.RawMessage{}
+		if err := json.Unmarshal(job.Metadata, &metadata); err != nil {
+			continue
+		}
+		var workflowID string
+		if raw, ok := metadata["workflow_id"]; ok {
+			if err := json.Unmarshal(raw, &workflowID); err == nil && workflowID != "" {
+				workflowIDs[workflowID] = struct{}{}
+			}
+		}
+	}
+
+	for workflowID := range workflowIDs {
+		if err := riverpilot.PromoteWorkflowPending(ctx, exec, c.config.Schema, workflowID); err != nil {
+			if errors.Is(err, riverdriver.ErrNotImplemented) {
+				continue
+			}
+			return err
+		}
+	}
+
+	return nil
 }
 
 // JobGet fetches a single job by its ID. Returns the up-to-date JobRow for the
@@ -1859,6 +1955,8 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	if argsWithSequence, ok := args.(JobArgsWithSequence); ok {
 		sequenceOpts := argsWithSequence.SequenceOpts()
 		metadataMap["sequence_key"] = sequenceKey(sequenceOpts, args, args.Kind(), queue, encodedArgs)
+		metadataMap["sequence_continue_on_cancelled"] = sequenceOpts.ContinueOnCancelled
+		metadataMap["sequence_continue_on_discarded"] = sequenceOpts.ContinueOnDiscarded
 	}
 
 	if argsWithBatch, ok := args.(JobArgsWithBatch); ok {
@@ -1906,6 +2004,8 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	}
 
 	if insertOpts.Pending {
+		insertParams.State = rivertype.JobStatePending
+	} else if _, ok := args.(JobArgsWithSequence); ok && insertParams.State == rivertype.JobStateAvailable {
 		insertParams.State = rivertype.JobStatePending
 	}
 
@@ -2374,6 +2474,11 @@ func (c *Client[TTx]) insertManyFast(ctx context.Context, execTx riverdriver.Exe
 	if err != nil {
 		return nil, err
 	}
+	for _, param := range insertParams {
+		if bytes.Contains(param.Metadata, []byte("\"sequence_key\"")) {
+			return c.insertMany(ctx, execTx, insertParams)
+		}
+	}
 
 	return c.insertManyShared(ctx, execTx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
 		count, err := execTx.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
@@ -2507,6 +2612,7 @@ func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) (*p
 		MaxWorkers:                   queueConfig.MaxWorkers,
 		MiddlewareLookupGlobal:       c.middlewareLookupGlobal,
 		Notifier:                     c.notifier,
+		PartitionKeyCacheTTL:         c.config.PartitionKeyCacheTTL,
 		PartitionByArgs:              concurrency.Partition.ByArgs,
 		PartitionByKind:              concurrency.Partition.ByKind,
 		Queue:                        queueName,
@@ -2589,6 +2695,9 @@ func (c *Client[TTx]) jobDeleteMany(ctx context.Context, exec riverdriver.Execut
 
 	jobs, err := exec.JobDeleteMany(ctx, (*riverdriver.JobDeleteManyParams)(listParams))
 	if err != nil {
+		return nil, err
+	}
+	if err := c.promotePendingWorkflowsForJobs(ctx, exec, jobs); err != nil {
 		return nil, err
 	}
 

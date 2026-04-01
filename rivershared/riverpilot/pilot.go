@@ -132,8 +132,9 @@ type PeriodicJobGetAllParams struct {
 }
 
 type PeriodicJobKeepAliveAndReapParams struct {
-	ID     []string
-	Schema string
+	ID             []string
+	Schema         string
+	StaleThreshold time.Duration
 }
 
 type PeriodicJobUpsertManyParams struct {

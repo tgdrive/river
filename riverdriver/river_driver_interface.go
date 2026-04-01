@@ -474,17 +474,18 @@ type JobDeleteByIDManyParams struct {
 }
 
 type JobGetAvailableParams struct {
-	ClientID        string
-	GlobalLimit     int32
-	LocalLimit      int32
-	MaxAttemptedBy  int
-	MaxToLock       int
-	Now             *time.Time
-	PartitionByArgs []string
-	PartitionByKind bool
-	ProducerID      int64
-	Queue           string
-	Schema          string
+	AvailablePartitionKeys []string
+	ClientID               string
+	GlobalLimit            int32
+	LocalLimit             int32
+	MaxAttemptedBy         int
+	MaxToLock              int
+	Now                    *time.Time
+	PartitionByArgs        []string
+	PartitionByKind        bool
+	ProducerID             int64
+	Queue                  string
+	Schema                 string
 }
 
 type JobGetAvailableForBatchParams struct {
@@ -523,8 +524,10 @@ type JobGetAvailableLimitedParams struct {
 }
 
 type JobGetAvailablePartitionKeysParams struct {
-	Queue  string
-	Schema string
+	PartitionByArgs []string
+	PartitionByKind bool
+	Queue           string
+	Schema          string
 }
 
 type JobGetByIDParams struct {
