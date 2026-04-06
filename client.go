@@ -12,6 +12,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -2018,7 +2019,7 @@ func hashStrings(parts ...string) string {
 		_, _ = h.Write([]byte(part))
 		_, _ = h.Write([]byte("|"))
 	}
-	return fmt.Sprintf("%x", h.Sum64())
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 func sequenceKey(opts SequenceOpts, args JobArgs, kind, queue string, encodedArgs []byte) string {
@@ -2104,7 +2105,7 @@ func hasRiverTagValue(tag, value string) bool {
 	if tag == "" {
 		return false
 	}
-	for _, part := range strings.Split(tag, ",") {
+	for part := range strings.SplitSeq(tag, ",") {
 		if strings.TrimSpace(part) == value {
 			return true
 		}

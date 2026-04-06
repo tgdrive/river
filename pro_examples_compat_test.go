@@ -2,7 +2,6 @@ package river_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -166,6 +165,7 @@ func (concurrencyExampleArgs) Kind() string { return "concurrency_limited_exampl
 
 type concurrencyExampleWorker struct {
 	river.WorkerDefaults[concurrencyExampleArgs]
+
 	running *atomic.Int64
 	maxSeen *atomic.Int64
 }
@@ -192,8 +192,7 @@ func (w *concurrencyExampleWorker) Work(ctx context.Context, job *river.Job[conc
 func TestExample_GlobalConcurrencyLimiting_Compat(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	dbPool := riversharedtest.DBPool(ctx, t)
 	driver := riverpgxv5.New(dbPool)
@@ -349,7 +348,7 @@ func TestExample_WorkflowLoadDepsAndLoadOutput_Compat(t *testing.T) {
 	err = workflow.LoadOutput(ctx, "task_b", &noOutput)
 	require.Error(t, err)
 	var noOutputErr *river.TaskHasNoOutputError
-	require.True(t, errors.As(err, &noOutputErr))
+	require.ErrorAs(t, err, &noOutputErr)
 }
 
 type workflowMultiChildArgs struct {
@@ -367,6 +366,7 @@ func (workflowMultiFinalizeArgs) Kind() string { return "workflow_multi_finalize
 
 type workflowMultiChildWorker struct {
 	river.WorkerDefaults[workflowMultiChildArgs]
+
 	running *atomic.Int64
 	maxSeen *atomic.Int64
 }
@@ -393,6 +393,7 @@ func (w *workflowMultiChildWorker) Work(ctx context.Context, job *river.Job[work
 
 type workflowMultiFinalizeWorker struct {
 	river.WorkerDefaults[workflowMultiFinalizeArgs]
+
 	client *river.Client[pgx.Tx]
 }
 
@@ -453,7 +454,7 @@ func TestExample_WorkflowParentAfterAllChildren_MultiWorker_Compat(t *testing.T)
 	workflow := client.NewWorkflow(&river.WorkflowOpts{ID: runID})
 
 	depNames := make([]string, 0, 6)
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		name := fmt.Sprintf("child_%d", i)
 		task := workflow.Add(name, workflowMultiChildArgs{RunID: runID, Index: i}, nil, nil)
 		depNames = append(depNames, task.Name)
@@ -483,6 +484,7 @@ func TestExample_WorkflowParentAfterAllChildren_MultiWorker_Compat(t *testing.T)
 
 type workflowDistributedChildWorker struct {
 	river.WorkerDefaults[workflowMultiChildArgs]
+
 	node string
 }
 
@@ -518,7 +520,7 @@ func TestExample_WorkflowParentAfterAllChildren_TwoClients_Compat(t *testing.T) 
 				river.QueueDefault: {
 					FetchCooldown:     10 * time.Millisecond,
 					FetchPollInterval: 10 * time.Millisecond,
-					MaxWorkers:        1,
+					MaxWorkers:        2,
 				},
 			},
 			Schema: schema, TestOnly: true, Workers: workers,
@@ -541,7 +543,7 @@ func TestExample_WorkflowParentAfterAllChildren_TwoClients_Compat(t *testing.T) 
 	workflow := clientA.NewWorkflow(&river.WorkflowOpts{ID: runID})
 
 	depNames := make([]string, 0, 10)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		name := fmt.Sprintf("child_%d", i)
 		task := workflow.Add(name, workflowMultiChildArgs{RunID: runID, Index: i}, nil, nil)
 		depNames = append(depNames, task.Name)

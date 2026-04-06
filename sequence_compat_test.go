@@ -18,7 +18,7 @@ import (
 )
 
 type sequenceCompatArgs struct {
-	CustomerID          string `json:"customer_id" river:"sequence"`
+	CustomerID          string `json:"customer_id"                     river:"sequence"`
 	Behavior            string `json:"behavior"`
 	ContinueOnCancelled bool   `json:"continue_on_cancelled,omitempty"`
 	ContinueOnDiscarded bool   `json:"continue_on_discarded,omitempty"`
@@ -38,6 +38,7 @@ type sequenceCompatState struct {
 
 type sequenceCompatWorker struct {
 	WorkerDefaults[sequenceCompatArgs]
+
 	state *sequenceCompatState
 }
 
@@ -113,7 +114,7 @@ func TestSequence_SerialBySequence_Compat(t *testing.T) {
 	require.NoError(t, client.Start(ctx))
 	defer client.Stop(context.Background())
 	jobs := []InsertManyParams{}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		jobs = append(jobs, InsertManyParams{Args: sequenceCompatArgs{CustomerID: "a", Behavior: fmt.Sprintf("ok-%d", i)}})
 		jobs = append(jobs, InsertManyParams{Args: sequenceCompatArgs{CustomerID: "b", Behavior: fmt.Sprintf("ok-%d", i)}})
 	}

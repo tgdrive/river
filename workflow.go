@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"time"
 
@@ -302,14 +303,14 @@ func (c *Client[TTx]) WorkflowRetryTx(ctx context.Context, tx TTx, workflowID st
 }
 
 func (c *Client[TTx]) WorkflowCancel(ctx context.Context, workflowID string) (*WorkflowCancelResult, error) {
-	return c.workflowCancel(ctx, c.driver.GetExecutor(), workflowID)
+	return c.workflowCancel(ctx, c.driver.GetExecutor(), workflowID, true)
 }
 
 func (c *Client[TTx]) WorkflowCancelTx(ctx context.Context, tx TTx, workflowID string) (*WorkflowCancelResult, error) {
-	return c.workflowCancel(ctx, c.driver.UnwrapExecutor(tx), workflowID)
+	return c.workflowCancel(ctx, c.driver.UnwrapExecutor(tx), workflowID, false)
 }
 
-func (c *Client[TTx]) workflowCancel(ctx context.Context, exec riverdriver.Executor, workflowID string) (*WorkflowCancelResult, error) {
+func (c *Client[TTx]) workflowCancel(ctx context.Context, exec riverdriver.Executor, workflowID string, notifyRunning bool) (*WorkflowCancelResult, error) {
 	jobs, err := exec.WorkflowCancel(ctx, &riverdriver.WorkflowCancelParams{Schema: c.config.Schema, WorkflowID: workflowID})
 	if errors.Is(err, riverdriver.ErrNotImplemented) {
 		return nil, errWorkflowNotImplemented
@@ -317,6 +318,35 @@ func (c *Client[TTx]) workflowCancel(ctx context.Context, exec riverdriver.Execu
 	if err != nil {
 		return nil, err
 	}
+
+	workflowJobs, err := exec.WorkflowJobList(ctx, &riverdriver.WorkflowJobListParams{Schema: c.config.Schema, WorkflowID: workflowID})
+	if errors.Is(err, riverdriver.ErrNotImplemented) {
+		return nil, errWorkflowNotImplemented
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	for _, job := range workflowJobs {
+		if job == nil || job.State != rivertype.JobStateRunning {
+			continue
+		}
+
+		cancelledJob, err := c.jobCancel(ctx, exec, job.ID)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, cancelledJob)
+
+		if notifyRunning {
+			c.notifyProducerWithoutListenerQueueControlEvent(cancelledJob.Queue, &controlEventPayload{
+				Action: controlActionCancel,
+				JobID:  cancelledJob.ID,
+				Queue:  cancelledJob.Queue,
+			})
+		}
+	}
+
 	return &WorkflowCancelResult{CancelledJobs: jobs}, nil
 }
 
@@ -390,9 +420,7 @@ func (w *WorkflowT[TTx]) Prepare(_ context.Context) (*WorkflowPrepareResult, err
 		if len(w.opts.Metadata) > 0 {
 			workflowMetadata := map[string]any{}
 			if err := json.Unmarshal(w.opts.Metadata, &workflowMetadata); err == nil {
-				for k, v := range workflowMetadata {
-					metadataMap[k] = v
-				}
+				maps.Copy(metadataMap, workflowMetadata)
 			}
 		}
 
@@ -417,9 +445,7 @@ func (w *WorkflowT[TTx]) Prepare(_ context.Context) (*WorkflowPrepareResult, err
 		if task.Opts != nil && len(task.Opts.Metadata) > 0 {
 			taskMetadata := map[string]any{}
 			if err := json.Unmarshal(task.Opts.Metadata, &taskMetadata); err == nil {
-				for k, v := range taskMetadata {
-					metadataMap[k] = v
-				}
+				maps.Copy(metadataMap, taskMetadata)
 			}
 		}
 
@@ -554,9 +580,7 @@ func (w *WorkflowT[TTx]) loadDeps(ctx context.Context, exec riverdriver.Executor
 			if err != nil {
 				return nil, err
 			}
-			for name, depTask := range depTasks.ByName {
-				out.ByName[name] = depTask
-			}
+			maps.Copy(out.ByName, depTasks.ByName)
 		}
 	}
 

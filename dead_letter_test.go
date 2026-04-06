@@ -93,7 +93,7 @@ func TestClient_DeadLetterAPIs(t *testing.T) {
 
 	jobsAfterRetry, err := client.JobDeadLetterList(ctx, 10)
 	require.NoError(t, err)
-	require.Len(t, jobsAfterRetry, 0)
+	require.Empty(t, jobsAfterRetry)
 
 	inserted2 := insertDiscardedJob(ctx, t, client)
 	moveDiscardedToDeadLetter(ctx, t, client)

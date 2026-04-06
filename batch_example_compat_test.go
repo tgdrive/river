@@ -3,7 +3,7 @@ package river_test
 import (
 	"context"
 	"errors"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -48,7 +48,7 @@ func (w *batchExampleWorker) WorkMany(_ context.Context, jobs []*river.Job[batch
 	for _, job := range jobs {
 		ids = append(ids, job.Args.InstanceID)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 
 	w.mu.Lock()
 	w.batches = append(w.batches, ids)
@@ -80,7 +80,7 @@ func TestExample_BatchWorker_Compat(t *testing.T) {
 		FetchPollInterval: 50 * time.Millisecond,
 		Queues: map[string]river.QueueConfig{
 			river.QueueDefault: {
-				MaxWorkers: 1,
+				MaxWorkers: 2,
 			},
 		},
 		Schema:   schema,

@@ -1416,8 +1416,10 @@ func (q *Queries) WorkflowSetPendingByIDMany(ctx context.Context, db DBTX, ids [
 
 const workflowStageJobsByIDMany = `-- name: WorkflowStageJobsByIDMany :many
 UPDATE /* TEMPLATE: schema */river_job
-SET state = 'available',
-    scheduled_at = now()
+SET state = CASE
+        WHEN scheduled_at <= now() THEN 'available'::/* TEMPLATE: schema */river_job_state
+        ELSE 'scheduled'::/* TEMPLATE: schema */river_job_state
+    END
 WHERE id = any($1::bigint[])
   AND state = 'pending'
 RETURNING id

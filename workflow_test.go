@@ -3,6 +3,7 @@ package river
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -58,7 +59,8 @@ func TestWorkflow_PrepareValidation(t *testing.T) {
 
 		_, err := workflow.Prepare(ctx)
 		require.Error(t, err)
-		_, ok := err.(*DuplicateTaskError)
+		duplicateTaskError := &DuplicateTaskError{}
+		ok := errors.As(err, &duplicateTaskError)
 		require.True(t, ok)
 	})
 
@@ -68,7 +70,8 @@ func TestWorkflow_PrepareValidation(t *testing.T) {
 
 		_, err := workflow.Prepare(ctx)
 		require.Error(t, err)
-		_, ok := err.(*MissingDependencyError)
+		missingDependencyError := &MissingDependencyError{}
+		ok := errors.As(err, &missingDependencyError)
 		require.True(t, ok)
 	})
 
@@ -79,7 +82,8 @@ func TestWorkflow_PrepareValidation(t *testing.T) {
 
 		_, err := workflow.Prepare(ctx)
 		require.Error(t, err)
-		_, ok := err.(*DependencyCycleError)
+		dependencyCycleError := &DependencyCycleError{}
+		ok := errors.As(err, &dependencyCycleError)
 		require.True(t, ok)
 	})
 

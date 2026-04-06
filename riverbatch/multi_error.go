@@ -3,7 +3,8 @@ package riverbatch
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -53,7 +54,7 @@ func (e *MultiError) Error() string {
 	for id := range e.byID {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 
 	parts := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -102,9 +103,7 @@ func (e *MultiError) ErrorsByID() map[int64]error {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	out := make(map[int64]error, len(e.byID))
-	for id, err := range e.byID {
-		out[id] = err
-	}
+	maps.Copy(out, e.byID)
 	return out
 }
 

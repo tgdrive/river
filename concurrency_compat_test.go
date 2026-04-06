@@ -113,8 +113,7 @@ func waitForCompletions(t *testing.T, n int, chans ...<-chan *Event) {
 func TestConcurrency_GlobalLimit_Compat(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	dbPool := riversharedtest.DBPool(ctx, t)
 	driver := riverpgxv5.New(dbPool)
@@ -180,8 +179,7 @@ func TestConcurrency_LocalLimit_Compat(t *testing.T) {
 func TestConcurrency_ByArgsPartition_Compat(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	dbPool := riversharedtest.DBPool(ctx, t)
 	driver := riverpgxv5.New(dbPool)
@@ -218,8 +216,7 @@ func TestConcurrency_ByArgsPartition_Compat(t *testing.T) {
 func TestConcurrency_ByArgsEmptySliceUsesAllArgs_Compat(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	dbPool := riversharedtest.DBPool(ctx, t)
 	driver := riverpgxv5.New(dbPool)

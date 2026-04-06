@@ -550,8 +550,10 @@ WHERE coalesce(workflow_id, metadata->>'workflow_id') = @workflow_id
 
 -- name: WorkflowStageJobsByIDMany :many
 UPDATE /* TEMPLATE: schema */river_job
-SET state = 'available',
-    scheduled_at = now()
+SET state = CASE
+        WHEN scheduled_at <= now() THEN 'available'::/* TEMPLATE: schema */river_job_state
+        ELSE 'scheduled'::/* TEMPLATE: schema */river_job_state
+    END
 WHERE id = any(@ids::bigint[])
   AND state = 'pending'
 RETURNING id;

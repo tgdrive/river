@@ -1102,7 +1102,7 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		for _, id := range []string{"periodic_job_10s", "periodic_job_20s"} {
 			periodicJob := svc.periodicJobs[svc.periodicJobIDs[id]]
 			require.True(t, periodicJob.nextRunAt.After(now))
-			require.True(t, !periodicJob.nextRunAt.After(now.Add(time.Minute+time.Second)))
+			require.False(t, periodicJob.nextRunAt.After(now.Add(time.Minute+time.Second)))
 		}
 	})
 

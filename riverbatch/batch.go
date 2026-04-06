@@ -79,14 +79,14 @@ func validateWorkerOpts(opts *WorkerOpts) error {
 }
 
 func keyForJob[T river.JobArgsWithBatch](job *river.Job[T]) string {
-	if job == nil || job.JobRow == nil || job.JobRow.Kind == "" {
+	if job == nil || job.JobRow == nil || job.Kind == "" {
 		return "batch"
 	}
 
 	batchKey := ""
-	if len(job.JobRow.Metadata) > 0 && !bytes.Equal(job.JobRow.Metadata, []byte("{}")) {
+	if len(job.Metadata) > 0 && !bytes.Equal(job.Metadata, []byte("{}")) {
 		metadata := map[string]json.RawMessage{}
-		if json.Unmarshal(job.JobRow.Metadata, &metadata) == nil {
+		if json.Unmarshal(job.Metadata, &metadata) == nil {
 			if raw, ok := metadata["batch_key"]; ok {
 				_ = json.Unmarshal(raw, &batchKey)
 			}
@@ -94,9 +94,9 @@ func keyForJob[T river.JobArgsWithBatch](job *river.Job[T]) string {
 	}
 
 	if batchKey == "" {
-		batchKey = job.JobRow.Kind
+		batchKey = job.Kind
 	}
-	return job.JobRow.Kind + ":" + batchKey
+	return job.Kind + ":" + batchKey
 }
 
 func flush[T river.JobArgsWithBatch](ctx context.Context, key string) {
@@ -121,12 +121,13 @@ func flush[T river.JobArgsWithBatch](ctx context.Context, key string) {
 	}
 
 	err := group.worker.WorkMany(ctx, jobs)
-	multiErr, _ := err.(*MultiError)
+	multiErr := &MultiError{}
+	hasMultiError := errors.As(err, &multiErr)
 
 	for _, item := range items {
 		itemErr := err
-		if multiErr != nil {
-			itemErr = multiErr.GetByID(item.job.JobRow.ID)
+		if hasMultiError {
+			itemErr = multiErr.GetByID(item.job.ID)
 		}
 		item.errCh <- itemErr
 	}
@@ -150,7 +151,7 @@ func Work[T river.JobArgsWithBatch](ctx context.Context, worker ManyWorker[T], j
 	}
 
 	jobs := []*river.Job[T]{job}
-	seenIDs := map[int64]struct{}{job.JobRow.ID: {}}
+	seenIDs := map[int64]struct{}{job.ID: {}}
 	deadline := time.Now().Add(resolvedOpts.MaxDelay)
 	batchKey := keyForJob(job)
 
@@ -207,7 +208,8 @@ func Work[T river.JobArgsWithBatch](ctx context.Context, worker ManyWorker[T], j
 	}
 
 	err = worker.WorkMany(ctx, jobs)
-	multiErr, ok := err.(*MultiError)
+	multiErr := &MultiError{}
+	ok := errors.As(err, &multiErr)
 	if !ok {
 		multiErr = NewMultiError()
 		if err != nil {
